@@ -8,7 +8,7 @@
     <img src="https://img.shields.io/badge/rust-2024%20edition-orange.svg" alt="Rust 2024" />
     <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT" />
     <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Android-lightgrey.svg" alt="Platform" />
-    <img src="https://img.shields.io/badge/tests-92%20passing-brightgreen.svg" alt="Tests" />
+    <img src="https://img.shields.io/badge/tests-94%20passing-brightgreen.svg" alt="Tests" />
   </p>
 
   <p>
@@ -452,9 +452,9 @@ cargo build --no-default-features --features sqlcipher   # 密文落盘
 - 密钥非空 + 构建含 SQLCipher → `PRAGMA key`，库以密文落盘。64 位十六进制密钥走 **raw key** 形式（`x'…'`）跳过 PBKDF2，打开几乎零延迟；其他字符串按口令处理；
 - 密钥非空 + 构建**不含** SQLCipher → 打 `WARN` 说明「以明文存储」，同时 `muclip_core_is_encrypted()` 返回 `0`，宿主可如实标注，不必靠猜。
 
-**没有做「明文库 → 加密库」的自动迁移**，这是个刻意的取舍：加密模式启动时若发现旧库是明文（文件头是 `SQLite format 3\0`），会把它改名成 `*.plaintext.bak` 让位，然后新建加密库。数据没删、能手工找回，只是不再自动加载。逐表搬运 + 中断恢复 + 双份临时文件的复杂度，对剪贴板这种可再生数据不值当——真要保留内容，走 `.mubc` 备份/还原。
+**不做任何自动迁移或探测**。加密模式下打开一个明文旧库、或者密钥不对，都会直接失败——SQLite 只回一句 `file is not a database`，所以失败时会额外打一条说明日志。原文件不会被改名，也不会被覆盖。旧数据请走 `.mubc` 备份/还原：剪贴板是可再生数据，为它写逐表搬运 + 中断恢复 + 双份临时文件的迁移不值得。
 
-反过来也成立：**加密开关一旦开启过就是单向的**。库已经是密文之后，不带密钥打开只会失败，并打一条 `ERROR` 说明原因。
+同一个道理反过来说：**加密开关一旦开启过就是单向的**，不带密钥打不开原库。
 
 ### 设计取舍（以及为什么）
 
@@ -524,7 +524,7 @@ cargo build --release --target aarch64-linux-android
 ### 测试与基准
 
 ```powershell
-cargo test                     # 92 项测试（85 单元 + 7 集成），含对抗性用例与全链路 PFS 验证
+cargo test                     # 94 项测试（87 单元 + 7 集成），含对抗性用例与全链路 PFS 验证
 cargo run --release --example bench_transfer   # 文件传输基准
 ```
 
