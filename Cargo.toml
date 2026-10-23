@@ -15,12 +15,24 @@ homepage = "https://github.com/katomegumi1999/MuClip"
 name = "muclip_core"
 crate-type = ["rlib", "cdylib"]
 
+[features]
+# 两个 SQLite 后端互斥，只能二选一，必须显式指定：
+#   默认（明文）    : cargo build
+#   SQLCipher（加密）: cargo build --no-default-features --features sqlcipher
+#
+# 之所以不用「默认开加密 + 显式关」：sqlcipher 分支依赖 OpenSSL，vendored 编译
+# 需要 perl 且首次构建要几分钟、产物也更大。让不想加密的人付这个代价不合理。
+default = ["plain"]
+plain = ["rusqlite/bundled"]
+# 库文件以密文落盘（SQLCipher 4）。构建期需要 perl，因为 openssl-src 要现场编译 OpenSSL。
+sqlcipher = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
+
 [[bin]]
 name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
 
 [dependencies]
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
