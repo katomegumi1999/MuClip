@@ -1750,7 +1750,7 @@ mod tests {
         let p = dir.path().join("enc.db");
         let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-        let db = Database::open_with_key(&p, Some(key)).unwrap();
+        let mut db = Database::open_with_key(&p, Some(key)).unwrap();
         assert!(db.is_encrypted());
         db.upsert_history("secret clipboard content", None).unwrap();
         drop(db);
@@ -1778,7 +1778,7 @@ mod tests {
         let key_b = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 
         {
-            let db = Database::open_with_key(&p, Some(key_a)).unwrap();
+            let mut db = Database::open_with_key(&p, Some(key_a)).unwrap();
             db.upsert_history("payload", None).unwrap();
         }
         // 错误密钥必然打不开（SQLCipher 在首次读取时才校验，故用 init_tables 触发）
