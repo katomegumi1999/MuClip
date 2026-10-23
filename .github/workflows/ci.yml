@@ -76,3 +76,13 @@ jobs:
         run: cargo clippy --all-targets --no-default-features --features sqlcipher -- -D clippy::correctness
       - name: Run tests (includes on-disk encryption cases)
         run: cargo test --no-default-features --features sqlcipher
+      # 顺手把带加密的 dll 传上来：宿主（小沐 OCR 等）可以直接下载替换，
+      # 不必为了编这一条分支在自己机器上装 perl。
+      - name: Build release (encryption enabled)
+        run: cargo build --release --no-default-features --features sqlcipher
+      - name: Upload muclip_core.dll (sqlcipher build)
+        uses: actions/upload-artifact@v4
+        with:
+          name: muclip-core-dll-sqlcipher
+          path: target/release/muclip_core.dll
+          if-no-files-found: warn
