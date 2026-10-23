@@ -78,6 +78,7 @@
 - SQLite 自动去重（Upsert）+ 模糊搜索 + 过期清理 + 分页。
 - 叠一层 LRU 内存池（默认 100 条 / 5 MB），退出回写，降低磁盘 I/O。
 - 常用语支持**时间规则**（起止时间、插入位置、追加文本）与规则模板。
+- 库文件可选用 **SQLCipher 4 加密落盘**（`--features sqlcipher`）；默认构建保持明文，不为不需要的人增加 OpenSSL 编译负担。
 
 **💾 单文件加密备份（`.mubc`）**
 
@@ -608,7 +609,7 @@ MuClip/
 - [ ] **P1｜显式 `muclip_sync_set_peer_key` 导出**：让密钥回灌脱离 6 段字符串的位置约定，并在两两密钥缺失时返回明确错误码而非静默回落
 - [ ] **断点续传**：协议里已预留 `offset` 字段但未实现，当前中断即从头重传
 - [ ] TOFU 设备指纹核对（配对界面显示指纹，本端校验）
-- [ ] SQLCipher 落盘加密（现在会探测 `cipher_version` 并在不可用时告警，加密本身尚未接入）
+- [x] **SQLCipher 落盘加密（可选特性）**：`--no-default-features --features sqlcipher` 即编译进来，库文件以密文落盘；未启用时 `PRAGMA cipher_version` 探测 + WARN + `is_encrypted()` 如实报告，不再静默
 - [ ] 图片 / 富文本剪贴板（当前以文本与 base64 承载）
 - [ ] Linux / macOS 桌面客户端
 - [ ] `criterion` 统计基准（现有基准是手写计时，缺置信区间与离群值剔除）
