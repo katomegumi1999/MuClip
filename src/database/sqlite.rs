@@ -171,40 +171,125 @@ fn sqlite_has_cipher(conn: &Connection) -> bool {
         .unwrap_or(false)
 }
 
+/// 用一个临时内存连接探测加密扩展是否存在。
+///
+/// 与 [`sqlite_has_cipher`] 的区别：这个不碰目标文件，因此可以在**决定怎么打开
+/// 磁盘上那个文件之前**先问「当前构建到底能不能加密」。
+fn probe_cipher_support() -> bool {
+    Connection::open_in_memory()
+        .map(|c| sqlite_has_cipher(&c))
+        .unwrap_or(false)
+}
+
+/// 判断磁盘上的文件是不是**明文** SQLite 库。
+///
+/// 明文 SQLite 文件固定以 16 字节魔数 `SQLite format 3\0` 开头；
+/// SQLCipher 加密后该位置是随机 salt，不会与魔数相同。
+fn is_plaintext_sqlite_file(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 16];
+    if f.read_exact(&mut head).is_err() {
+        return false;
+    }
+    &head == b"SQLite format 3\0"
+}
+
+/// 明文旧库的让位路径：`muclip.db` → `muclip.db.plaintext.bak`。
+fn plaintext_aside_path(path: &Path) -> std::path::PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("muclip.db"));
+    name.push(".plaintext.bak");
+    path.with_file_name(name)
+}
+
+/// 判断密钥是不是 64 位十六进制（256 bit）。
+fn is_hex_key_64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// 把密钥交给 SQLCipher。
+///
+/// 64 位十六进制串走 **raw key** 形式 `PRAGMA key = "x'…'"`，跳过 SQLCipher 的
+/// PBKDF2（默认 25 万轮），打开几乎零延迟；其他任意字符串按口令处理，由
+/// SQLCipher 自己派生。
+fn apply_key(conn: &Connection, key: &str) -> Result<()> {
+    if is_hex_key_64(key) {
+        // key 已校验为纯十六进制，拼接进 SQL 无注入风险
+        conn.execute_batch(&format!("PRAGMA key = \"x'{key}'\";"))
+    } else {
+        conn.pragma_update(None, "key", key)
+    }
+}
+
 #[allow(dead_code)]
 impl Database {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         Self::open_with_key(path, None)
     }
 
-    /// 打开数据库，可选传入十六进制密钥。
+    /// 打开数据库，可选传入密钥。密钥为空 / `None` 即明文模式。
     ///
-    /// **重要**：密钥只有在构建启用了 SEE / SQLCipher 时才真正生效。本仓默认使用
-    /// `rusqlite` 的 `bundled` 特性，**不含加密扩展**，此时 `key_hex` 会被忽略并
-    /// 打一条 WARN 日志（走 [`crate::diag`]，在 GUI 宿主下也能被取走）。
+    /// **加密是可选能力**：只有构建时启用 `sqlcipher` 特性（`--features sqlcipher`），
+    /// 且调用方确实传了密钥，库文件才会以密文落盘；两者缺一都退回明文，并打一条
+    /// WARN 让宿主能把真实状态显示出来（[`Database::is_encrypted`]）。
     ///
-    /// 之所以不直接报错：既有调用方（C# / Kotlin）已经传了这个参数，报错会打断
-    /// 升级。真正需要的是「让不加密这件事变得可见」，而不是让程序起不来。
-    /// 宿主可用 [`Database::is_encrypted`] 判断并在 UI 上如实呈现。
+    /// 密钥形状决定 SQLCipher 的处理方式：64 位十六进制按 raw key 用，跳过 PBKDF2；
+    /// 其他字符串按口令处理。
+    ///
+    /// **关于明文旧库**：加密模式下如果磁盘上躺着一个明文库，这里不做事后迁移，
+    /// 而是把它改名成 `*.plaintext.bak` 让位，然后新建加密库。数据没有删除，只是
+    /// 不再自动加载 —— 事后迁移的复杂度（逐表搬运 + 中断恢复 + 双份临时文件）
+    /// 对剪贴板这种可再生的数据不值当。要保留旧内容请走 `.mubc` 备份/还原。
     pub fn open_with_key<P: AsRef<Path>>(path: P, key_hex: Option<&str>) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        let cipher_ready = sqlite_has_cipher(&conn);
+        let path = path.as_ref();
+        let key = key_hex.map(str::trim).filter(|k| !k.is_empty());
+        // 先问构建能力，再决定怎么碰磁盘上的文件——顺序反了就会先打开再改名，白忙。
+        let cipher_ready = probe_cipher_support();
         let mut encryption_active = false;
 
-        if let Some(key) = key_hex {
-            let trimmed = key.trim();
-            if !trimmed.is_empty() {
-                if cipher_ready {
-                    conn.pragma_update(None, "key", trimmed)?;
-                    encryption_active = true;
-                } else {
-                    // 这条必须足够显眼：安全承诺与实现不符是最容易误导用户的缺陷，
-                    // 而它此前是静默的——调用方以为加密了，磁盘上却是明文。
-                    crate::log_warn!(
-                        "SQLite 加密不可用：当前构建未启用 SEE/SQLCipher，PRAGMA key 被忽略，\
-                         数据库以**明文**存储。若此处参数来自用户的加密开关，请勿在界面上声称已加密。"
-                    );
+        if key.is_some() {
+            if cipher_ready {
+                if is_plaintext_sqlite_file(path) {
+                    let aside = plaintext_aside_path(path);
+                    match std::fs::rename(path, &aside) {
+                        Ok(()) => crate::log_warn!(
+                            "检测到未加密的旧库，已改名保留为 {:?}，本次将新建加密库。\
+                             旧内容不会自动导入；如需保留请用 .mubc 备份/还原迁移。",
+                            aside
+                        ),
+                        Err(e) => crate::log_error!(
+                            "旧明文库改名失败（{}），将以加密方式打开原文件，预计会失败",
+                            e
+                        ),
+                    }
                 }
+            } else {
+                // 这条必须足够显眼：安全承诺与实现不符是最容易误导用户的缺陷，
+                // 而它此前是静默的——调用方以为加密了，磁盘上却是明文。
+                crate::log_warn!(
+                    "SQLite 加密不可用：本次构建未启用 sqlcipher 特性，密钥被忽略，\
+                     数据库以**明文**存储。若此处参数来自用户的加密开关，请勿在界面上声称已加密。"
+                );
+            }
+        } else if cipher_ready && path.exists() && !is_plaintext_sqlite_file(path) {
+            // 反过来的情况：库已经是密文，但这次没给密钥（比如用户在设置里把开关关了）。
+            // 加密开关一旦开启过就是单向的，关掉只会让原库打不开。
+            crate::log_error!(
+                "数据库已加密，但本次未提供密钥。加密开关一旦启用过就无法关闭——\
+                 要么继续提供同一密钥，要么删掉旧库重新开始。"
+            );
+        }
+
+        let conn = Connection::open(path)?;
+        if let Some(k) = key {
+            if cipher_ready {
+                apply_key(&conn, k)?;
+                encryption_active = true;
             }
         }
 
@@ -1586,5 +1671,144 @@ mod tests {
         assert_eq!(summary_merge.history_count, 2);
         let history_merged = db2.query_history(10).unwrap();
         assert_eq!(history_merged.len(), 3);
+    }
+
+    // ---------------------------------------------------------------
+    // 静态加密相关的辅助函数：不依赖 SQLCipher，任何构建都会跑
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn hex_key_detection_only_accepts_256_bit_hex() {
+        assert!(is_hex_key_64(&"a".repeat(64)));
+        assert!(is_hex_key_64(
+            "0123456789abcdef0123456789ABCDEF0123456789abcdef0123456789abcdef"
+        ));
+        // 长度不足 / 超长
+        assert!(!is_hex_key_64(&"a".repeat(63)));
+        assert!(!is_hex_key_64(&"a".repeat(65)));
+        // 含非十六进制字符
+        assert!(!is_hex_key_64(&"z".repeat(64)));
+        // 口令形态的密钥
+        assert!(!is_hex_key_64("my passphrase"));
+        assert!(!is_hex_key_64(""));
+    }
+
+    #[test]
+    fn plaintext_aside_path_keeps_original_name() {
+        let p = std::path::Path::new("C:/data/muclip.db");
+        assert_eq!(
+            plaintext_aside_path(p),
+            std::path::Path::new("C:/data/muclip.db.plaintext.bak")
+        );
+        // 无后缀文件名也要能处理
+        assert_eq!(
+            plaintext_aside_path(std::path::Path::new("/tmp/muclip")),
+            std::path::Path::new("/tmp/muclip.plaintext.bak")
+        );
+    }
+
+    #[test]
+    fn plaintext_detection_matches_sqlite_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain.db");
+        {
+            let mut db = Database::open(&plain).unwrap();
+            db.upsert_history("hello", None).unwrap();
+        }
+        assert!(is_plaintext_sqlite_file(&plain));
+
+        // 不存在的文件、以及非 SQLite 内容的文件都不算明文库
+        assert!(!is_plaintext_sqlite_file(&dir.path().join("nope.db")));
+        let junk = dir.path().join("junk.bin");
+        std::fs::write(&junk, b"not a database at all").unwrap();
+        assert!(!is_plaintext_sqlite_file(&junk));
+    }
+
+    /// 默认构建（未启用 sqlcipher）下必须如实报告「没加密」，而不是假装成功。
+    #[test]
+    #[cfg(not(feature = "sqlcipher"))]
+    fn plaintext_build_reports_not_encrypted() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("plain.db");
+        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let db = Database::open_with_key(&p, Some(key)).unwrap();
+        assert!(!db.is_encrypted());
+        drop(db);
+        // 落盘后仍是明文 SQLite
+        assert!(is_plaintext_sqlite_file(&p));
+    }
+
+    // ---------------------------------------------------------------
+    // 以下用例只在 `--features sqlcipher` 构建下有意义：
+    //   cargo test --no-default-features --features sqlcipher
+    // ---------------------------------------------------------------
+
+    #[test]
+    #[cfg(feature = "sqlcipher")]
+    fn sqlcipher_writes_encrypted_file_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("enc.db");
+        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        let db = Database::open_with_key(&p, Some(key)).unwrap();
+        assert!(db.is_encrypted());
+        db.upsert_history("secret clipboard content", None).unwrap();
+        drop(db);
+
+        // 文件头不再是明文魔数，且全文搜不到明文
+        assert!(!is_plaintext_sqlite_file(&p));
+        let raw = std::fs::read(&p).unwrap();
+        assert!(
+            !raw.windows(9).any(|w| w == b"secret cl"),
+            "加密库里不应出现明文内容"
+        );
+
+        // 同一密钥可再次打开并读回数据
+        let db2 = Database::open_with_key(&p, Some(key)).unwrap();
+        assert!(db2.is_encrypted());
+        assert_eq!(db2.query_history(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    #[cfg(feature = "sqlcipher")]
+    fn sqlcipher_rejects_wrong_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("enc.db");
+        let key_a = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let key_b = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+        {
+            let db = Database::open_with_key(&p, Some(key_a)).unwrap();
+            db.upsert_history("payload", None).unwrap();
+        }
+        // 错误密钥必然打不开（SQLCipher 在首次读取时才校验，故用 init_tables 触发）
+        assert!(Database::open_with_key(&p, Some(key_b)).is_err());
+    }
+
+    /// 加密模式下遇到明文旧库：改名让位 + 新建加密库，旧数据不丢但也不自动导入。
+    #[test]
+    #[cfg(feature = "sqlcipher")]
+    fn plaintext_db_is_moved_aside_instead_of_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("muclip.db");
+        {
+            let mut db = Database::open(&p).unwrap();
+            db.upsert_history("old plaintext row", None).unwrap();
+        }
+        assert!(is_plaintext_sqlite_file(&p));
+
+        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let db = Database::open_with_key(&p, Some(key)).unwrap();
+        assert!(db.is_encrypted());
+        // 新库是空的——旧数据没有被迁移
+        assert_eq!(db.query_history(10).unwrap().len(), 0);
+        drop(db);
+
+        // 旧库原样躺在 .plaintext.bak 里，可人工找回
+        let aside = plaintext_aside_path(&p);
+        assert!(aside.exists());
+        assert!(is_plaintext_sqlite_file(&aside));
+        let old = Database::open(&aside).unwrap();
+        assert_eq!(old.query_history(10).unwrap().len(), 1);
     }
 }

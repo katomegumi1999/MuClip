@@ -434,16 +434,26 @@ SPAKE2(Ed25519, 单次性) ──> shared_secret (32B) ───┘
 | :--- | :--- | :--- |
 | 局域网传输内容 | 本库（临时 X25519 + XChaCha20-Poly1305） | ✅ 始终启用 |
 | `.mubc` 备份文件 | 本库（PBKDF2 10 万轮 → XChaCha20-Poly1305） | ✅ 始终启用，纯 Rust 实现，无外部依赖 |
-| 本地 SQLite 库文件 | SQLCipher（依赖构建特性） | ⚠️ **默认不加密**，见下 |
+| 本地 SQLite 库文件 | SQLCipher 4 | ⚙️ **可选特性**，默认构建不含 |
 
-**关于库文件的静态加密**：`open_with_key` 会先探测 `PRAGMA cipher_version`。当前默认构建用 `rusqlite` 的 `bundled` 特性（普通 SQLite），SQLCipher 未被编译进来，此时 `PRAGMA key` 是一个未知 pragma，**SQLite 会静默忽略**——调用成功返回，数据照旧明文落盘。
+**怎么开**：两个后端互斥，必须显式二选一。
 
-这种「看起来加密了、其实没有」是最危险的失败模式，所以本库不再让它静默发生：
+```bash
+cargo build                                          # 明文（默认，快）
+cargo build --no-default-features --features sqlcipher   # 密文落盘
+```
 
-- 探测失败时打一条 `WARN` 级别的诊断日志，明说「数据库以明文存储」；
-- 提供 `muclip_core_is_encrypted(handle)` 三态返回（`1` 已加密 / `0` 明文 / `-1` 句柄无效），宿主可以据此在 UI 上如实标注，而不是靠猜。
+不走「默认加密、显式关闭」是因为 `sqlcipher` 分支要现场编译 OpenSSL：**构建期需要 perl**，首次编译几分钟，产物也更大。不想加密的人没必要付这个代价。
 
-要真正启用静态加密，需把依赖换成 `rusqlite = { features = ["bundled-sqlcipher"] }`（或 `bundled-sqlcipher-vendored-openssl`），构建会变慢并引入 OpenSSL。这是一项需要公开宣称与验证的工程决策，不在 `0.1.0` 的范围内。
+**运行期行为**（`open_with_key`）：
+
+- 密钥为空 → 明文打开，与以前完全一致；
+- 密钥非空 + 构建含 SQLCipher → `PRAGMA key`，库以密文落盘。64 位十六进制密钥走 **raw key** 形式（`x'…'`）跳过 PBKDF2，打开几乎零延迟；其他字符串按口令处理；
+- 密钥非空 + 构建**不含** SQLCipher → 打 `WARN` 说明「以明文存储」，同时 `muclip_core_is_encrypted()` 返回 `0`，宿主可如实标注，不必靠猜。
+
+**没有做「明文库 → 加密库」的自动迁移**，这是个刻意的取舍：加密模式启动时若发现旧库是明文（文件头是 `SQLite format 3\0`），会把它改名成 `*.plaintext.bak` 让位，然后新建加密库。数据没删、能手工找回，只是不再自动加载。逐表搬运 + 中断恢复 + 双份临时文件的复杂度，对剪贴板这种可再生数据不值当——真要保留内容，走 `.mubc` 备份/还原。
+
+反过来也成立：**加密开关一旦开启过就是单向的**。库已经是密文之后，不带密钥打开只会失败，并打一条 `ERROR` 说明原因。
 
 ### 设计取舍（以及为什么）
 
@@ -462,8 +472,9 @@ SPAKE2(Ed25519, 单次性) ──> shared_secret (32B) ───┘
 
 ### 已知边界（诚实版）
 
-- **SQLite 默认不加密**。`Database::open_with_key` 会下发 `PRAGMA key`，但当前依赖链是 `rusqlite` 的 vanilla `bundled` 构建，**该 pragma 实际是 no-op**。需要真正落盘加密请换 `bundled-sqlcipher` 并验证 `PRAGMA cipher_version`，否则请把数据库目录权限设为仅当前用户可读。
-  - 这个陷阱此前是**静默**的：调用方以为加密了，磁盘上却是明文。现在核心会在打开时探测 `PRAGMA cipher_version`，不可用就打一条 WARN 日志；`muclip_core_is_encrypted()` 返回 `0` 表示明文、`1` 表示确实加密、`-1` 表示句柄无效。**宿主不应在 `0` 时于界面上标注「已加密」。**
+- **SQLite 落盘加密是可选特性，默认构建不含**。要启用必须 `--no-default-features --features sqlcipher`，否则 `PRAGMA key` 在 vanilla SQLite 上是未知 pragma、**被静默忽略**。
+  - 这个陷阱此前是**静默**的：调用方以为加密了，磁盘上却是明文。现在核心会先探测 `PRAGMA cipher_version`，不可用就打一条 WARN 日志；`muclip_core_is_encrypted()` 返回 `0` 表示明文、`1` 表示确实加密、`-1` 表示句柄无效。**宿主不应在 `0` 时于界面上标注「已加密」。**
+  - 不启用加密时，建议把数据库目录权限设为仅当前用户可读。
 - **配对帧使用固定引导密钥**（`PAIR_BOOTSTRAP_KEY`）。它不是秘密（源码里就有），作用只是给配对载荷一个统一的帧格式。机密性来自 SPAKE2，**不要把引导密钥当作安全边界**。配对完成后所有**业务**数据流（剪贴板、文件、解除配对通告）均强制走已认证的 PFS 会话；心跳与发现广播是例外，它们本来就承载广播元数据（见上方「全链路前向保密」表末行）。
 - **无身份持久化校验**。当前配对信任链终止于"PIN 由用户比对"。没有 TOFU 指纹核对界面，因此同网段主动 MITM（同时冒充两端）在用户不核对 PIN 的场景下理论可行。
 - **依赖可信网络假设**。设计目标是"家庭 / 办公局域网"。在公共 Wi-Fi 或云主机网络上请自行评估。
@@ -483,6 +494,14 @@ SPAKE2(Ed25519, 单次性) ──> shared_secret (32B) ───┘
 cargo build --release
 # 产物：target/release/muclip_core.dll
 ```
+
+要产出**带静态加密**的 dll，加一个特性开关（互斥，必须显式禁默认）：
+
+```powershell
+cargo build --release --no-default-features --features sqlcipher
+```
+
+这条命令会现场编译 SQLCipher 与 OpenSSL，**构建机需要 perl**（`choco install strawberryperl`）。首次编译几分钟，之后走 cargo 缓存；产物比明文版大几 MB。
 
 ### Android（`libmuclip_core.so`）
 

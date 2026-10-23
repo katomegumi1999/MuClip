@@ -54,3 +54,25 @@ jobs:
           name: muclip-core-dll
           path: target/release/muclip_core.dll
           if-no-files-found: warn
+
+  # 4. SQLCipher 静态加密：这条分支要现场编译 OpenSSL，构建期依赖 perl。
+  #    GitHub 的 windows runner 预装 Strawberry Perl，本地开发机未必有，
+  #    所以把这条链路的验证放到 CI，避免「代码写了但从没编过」。
+  sqlcipher:
+    name: SQLCipher Build & Encryption Tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # 与默认构建分开缓存，避免 bundled/plain 与 sqlcipher 产物互相污染
+          key: sqlcipher
+      - name: Check perl (openssl-src build dependency)
+        run: perl -v
+      - name: Clippy with sqlcipher feature
+        run: cargo clippy --all-targets --no-default-features --features sqlcipher -- -D clippy::correctness
+      - name: Run tests (includes on-disk encryption cases)
+        run: cargo test --no-default-features --features sqlcipher
