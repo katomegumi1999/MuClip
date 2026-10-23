@@ -1,0 +1,20 @@
+# 统一行尾，避免 Windows / Linux / macOS 各自 checkout 后产生整文件 diff
+* text=auto eol=lf
+
+# PowerShell 脚本按 Windows 惯例保留 CRLF（部分旧版 PowerShell 对 LF 脚本容错较差）
+*.ps1  text eol=crlf
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+
+# 二进制，禁止任何换行转换与文本 diff
+*.png  binary
+*.jpg  binary
+*.ico  binary
+*.dll  binary
+*.so   binary
+*.a    binary
+*.lib  binary
+*.zip  binary
+
+# 锁定文件在 diff 中折叠，不参与代码评审
+Cargo.lock  linguist-generated=true

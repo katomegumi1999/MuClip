@@ -1,0 +1,29 @@
+# 构建产物
+/target
+# 预编译动态库属于发布产物，走 GitHub Releases，不入库
+/dist/
+
+# 本地 IDE / 工具环境（含本机绝对路径，不应入库）
+/.cargo/config.toml
+/.vscode/
+/.idea/
+
+# AI 助手工作目录与内部状态
+/.workbuddy/
+/.agents/
+/.claude/
+/CLAUDE.md
+
+# 内部文档：不随开源仓库发布
+# - AGENTS.md 是 AI 助手的协作规则（与 /.agents/ 同类），**故意保留本机真实路径**，
+#   因为本地 AI 靠它直接定位跨仓目录。若要公开，先把路径脱敏（见文件顶部说明）。
+# - docs/ 已把本机路径替换为占位符，因此可以公开
+/AGENTS.md
+
+# 误入的临时文件
+.FullName
+*.pdb
+*.zip
+*.tmp
+.DS_Store
+Thumbs.db

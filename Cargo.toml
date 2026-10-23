@@ -1,0 +1,52 @@
+[package]
+name = "muclip-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Zero-config LAN clipboard sync and encrypted peer-to-peer file transfer engine, with C ABI / JNI / UniFFI bindings."
+license = "MIT"
+readme = "README.md"
+keywords = ["clipboard", "p2p", "lan", "file-transfer", "chacha20"]
+categories = ["network-programming", "cryptography"]
+repository = "https://github.com/katomegumi1999/MuClip"
+homepage = "https://github.com/katomegumi1999/MuClip"
+
+[lib]
+name = "muclip_core"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+rusqlite = { version = "0.40", features = ["bundled"] }
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uniffi = { version = "0.28", features = ["cli"] }
+thiserror = "2.0"
+jni = "0.21"
+chacha20poly1305 = "0.10"
+chacha20 = "0.9"
+sha2 = "0.10"
+hkdf = "0.12"
+rand = "0.8"
+socket2 = "0.5"
+x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
+spake2 = "0.4"
+uuid = { version = "1.28.0", features = ["v7", "serde"] }
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+subtle = "2.6"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+hmac = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
