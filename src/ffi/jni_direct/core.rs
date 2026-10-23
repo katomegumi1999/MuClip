@@ -1,6 +1,6 @@
 use jni::JNIEnv;
 use jni::objects::{JClass, JLongArray, JObject, JString};
-use jni::sys::{jint, jlong};
+use jni::sys::{jboolean, jint, jlong};
 use std::slice;
 
 use crate::cache::MemoryCache;
@@ -624,8 +624,44 @@ pub unsafe extern "system" fn Java_com_muclip_core_MuClipNative_nativeQueryRuleT
     JString::from(JObject::null())
 }
 
+// -----------------------------------------------------------------------------
+// Encrypted Backup (.mubc) — Android export / import
+// -----------------------------------------------------------------------------
+//
+// 返回约定：统一的 JSON 信封，宿主不必靠 null 猜失败原因。
+//   成功 {"ok":true,"data":{...}}
+//   失败 {"ok":false,"error":"..."}
+// 用 JSON 信封而不是抛 Java 异常，是为了让 Kotlin 侧只有一条错误分支。
+
+fn backup_result_json(result: Result<crate::database::sqlite::BackupSummary, String>) -> String {
+    match result {
+        Ok(summary) => {
+            let data = serde_json::json!({
+                "historyCount": summary.history_count,
+                "phraseCount": summary.phrase_count,
+                "ruleCount": summary.rule_count,
+                "templateCount": summary.template_count,
+                "configCount": summary.config_count,
+            });
+            serde_json::json!({ "ok": true, "data": data }).to_string()
+        }
+        Err(e) => serde_json::json!({ "ok": false, "error": e }).to_string(),
+    }
+}
+
+fn backup_failure_json(message: &str) -> String {
+    backup_result_json(Err(message.to_string()))
+}
+
+fn backup_string<'local>(env: &mut JNIEnv<'local>, json: String) -> JString<'local> {
+    match env.new_string(json) {
+        Ok(s) => s,
+        Err(_) => JString::from(JObject::null()),
+    }
+}
+
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_com_muclip_core_MuClipNative_nativeExportDb<'local>(
+pub extern "system" fn Java_com_muclip_core_MuClipNative_nativeExportDb<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
@@ -633,62 +669,79 @@ pub unsafe extern "system" fn Java_com_muclip_core_MuClipNative_nativeExportDb<'
     password: JString<'local>,
 ) -> JString<'local> {
     if handle == 0 {
-        return JString::from(JObject::null());
+        return backup_string(&mut env, backup_failure_json("无效的引擎句柄"));
     }
     let path_str: String = match env.get_string(&export_path) {
         Ok(s) => s.into(),
-        Err(_) => return JString::from(JObject::null()),
+        Err(_) => return backup_string(&mut env, backup_failure_json("路径参数无法转换为 UTF-8")),
     };
     let pwd_str: String = match env.get_string(&password) {
         Ok(s) => s.into(),
-        Err(_) => return JString::from(JObject::null()),
+        Err(_) => return backup_string(&mut env, backup_failure_json("口令参数无法转换为 UTF-8")),
     };
 
-    let engine_handle = unsafe { &*(handle as usize as *mut MuClipCoreHandle) };
-    if let Ok(engine) = engine_handle.inner.lock() {
-        if let Ok(summary) = engine.db.export_encrypted(&path_str, &pwd_str) {
-            let json = serde_json::to_string(&summary).unwrap_or_else(|_| "{}".to_string());
-            if let Ok(js) = env.new_string(json) {
-                return js;
-            }
-        }
-    }
-    JString::from(JObject::null())
+    let ptr = handle as usize as *mut MuClipCoreHandle;
+    let result = match unsafe { ptr.as_ref() } {
+        Some(h) => match h.inner.lock() {
+            Ok(engine) => engine
+                .db
+                .export_encrypted(&path_str, &pwd_str)
+                .map_err(|e| e.to_string()),
+            Err(_) => Err("引擎锁已中毒".to_string()),
+        },
+        None => Err("无效的引擎句柄".to_string()),
+    };
+
+    backup_string(&mut env, backup_result_json(result))
 }
 
+/// 从 `.mubc` 导入。`replace_all` 为 true 表示完全覆盖，false 表示合并。
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_com_muclip_core_MuClipNative_nativeImportDb<'local>(
+pub extern "system" fn Java_com_muclip_core_MuClipNative_nativeImportDb<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
     import_path: JString<'local>,
     password: JString<'local>,
-    replace_all: jint,
+    replace_all: jboolean,
 ) -> JString<'local> {
     if handle == 0 {
-        return JString::from(JObject::null());
+        return backup_string(&mut env, backup_failure_json("无效的引擎句柄"));
     }
     let path_str: String = match env.get_string(&import_path) {
         Ok(s) => s.into(),
-        Err(_) => return JString::from(JObject::null()),
+        Err(_) => return backup_string(&mut env, backup_failure_json("路径参数无法转换为 UTF-8")),
     };
     let pwd_str: String = match env.get_string(&password) {
         Ok(s) => s.into(),
-        Err(_) => return JString::from(JObject::null()),
+        Err(_) => return backup_string(&mut env, backup_failure_json("口令参数无法转换为 UTF-8")),
     };
 
-    let engine_handle = unsafe { &*(handle as usize as *mut MuClipCoreHandle) };
-    if let Ok(mut engine) = engine_handle.inner.lock() {
-        let MuClipCoreEngine { cache, db } = &mut *engine;
-        if let Ok(summary) = db.import_encrypted(&path_str, &pwd_str, replace_all != 0) {
-            let _ = cache.load_from_db(db);
-            let json = serde_json::to_string(&summary).unwrap_or_else(|_| "{}".to_string());
-            if let Ok(js) = env.new_string(json) {
-                return js;
+    let ptr = handle as usize as *mut MuClipCoreHandle;
+    let result = match unsafe { ptr.as_ref() } {
+        Some(h) => match h.inner.lock() {
+            Ok(mut engine) => engine
+                .db
+                .import_encrypted(&path_str, &pwd_str, replace_all != 0)
+                .map_err(|e| e.to_string()),
+            Err(_) => Err("引擎锁已中毒".to_string()),
+        },
+        None => Err("无效的引擎句柄".to_string()),
+    };
+
+    // 导入会增删 history / phrases，缓存必须整体重建而不是叠加，
+    // 否则完全覆盖模式下 UI 还会残留被删掉的旧条目。
+    if result.is_ok() {
+        if let Some(h) = unsafe { ptr.as_ref() } {
+            if let Ok(mut engine) = h.inner.lock() {
+                let MuClipCoreEngine { cache, db } = &mut *engine;
+                *cache = MemoryCache::new();
+                let _ = cache.load_from_db(db);
             }
         }
     }
-    JString::from(JObject::null())
+
+    backup_string(&mut env, backup_result_json(result))
 }
 
 // -----------------------------------------------------------------------------
@@ -748,4 +801,25 @@ pub unsafe extern "system" fn Java_com_muclip_core_MuClipNative_nativeAnalyzeCon
         return -1;
     };
     encode_content_analysis(&analysis, out_slice)
+}
+
+/// 本地库当前是否真的走了加密。返回 1 加密 / 0 明文 / -1 句柄无效。
+/// 注意：这是如实上报「实际生效状态」，不是「请求了加密」。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_muclip_core_MuClipNative_nativeIsEncrypted(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jint {
+    if handle == 0 {
+        return -1;
+    }
+    let ptr = handle as usize as *mut MuClipCoreHandle;
+    match unsafe { ptr.as_ref() } {
+        Some(h) => match h.inner.lock() {
+            Ok(engine) => engine.db.is_encrypted() as i32,
+            Err(_) => -1,
+        },
+        None => -1,
+    }
 }
