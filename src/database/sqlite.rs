@@ -1026,7 +1026,9 @@ impl Database {
 
         let derived_key =
             crate::sync::crypto::derive_backup_key(trimmed_pwd, &salt, BACKUP_PBKDF2_ROUNDS);
-        let json_bytes = serde_json::to_vec(&backup_payload)?;
+        // 顺序不能反：先压缩再加密。反过来（先加密后压缩）既没压缩率，
+        // 又会把密文长度泄露成压缩后的熵，属于教科书级错误。
+        let json_bytes = deflate_bytes(&serde_json::to_vec(&backup_payload)?)?;
 
         let ciphertext = crate::sync::crypto::encrypt_payload_with_aad(
             &*derived_key,
@@ -1078,7 +1080,7 @@ impl Database {
             return Err(BackupError::InvalidFormat);
         }
         let version = header[4];
-        if version != BACKUP_VERSION {
+        if !(BACKUP_MIN_VERSION..=BACKUP_VERSION).contains(&version) {
             return Err(BackupError::UnsupportedVersion(version));
         }
 
@@ -1103,7 +1105,13 @@ impl Database {
         )
         .map_err(|_| BackupError::InvalidPasswordOrCorrupted)?;
 
-        let backup: EncryptedDatabaseBackup = serde_json::from_slice(&decrypted_bytes)?;
+        // v1 的载荷是裸 JSON；v2 起才压缩。老备份照样能读，不因为升级作废。
+        let payload_bytes = if version >= 2 {
+            inflate_bytes(&decrypted_bytes)?
+        } else {
+            decrypted_bytes
+        };
+        let backup: EncryptedDatabaseBackup = serde_json::from_slice(&payload_bytes)?;
 
         let tx = self.conn.transaction()?;
 
@@ -1299,9 +1307,41 @@ impl Database {
 }
 
 pub const BACKUP_MAGIC: &[u8; 4] = b"MUBC";
-pub const BACKUP_VERSION: u8 = 1;
+/// 当前写出的格式版本。
+///
+/// - v1：载荷是裸 JSON
+/// - v2：载荷是 **deflate 压缩后的** JSON（先压缩再加密，顺序不能反）
+pub const BACKUP_VERSION: u8 = 2;
+/// 仍然接受读入的最老版本。v1 的备份不因为升级而作废。
+pub const BACKUP_MIN_VERSION: u8 = 1;
 pub const BACKUP_HEADER_SIZE: usize = 68;
 pub const BACKUP_PBKDF2_ROUNDS: u32 = 100_000;
+
+/// 解压后的上限，防止构造的备份文件把内存打爆（解压炸弹）。
+const BACKUP_MAX_INFLATED: u64 = 512 * 1024 * 1024;
+
+/// 原始 deflate 压缩（不带 zlib / gzip 封装头，省 6~18 字节）。
+fn deflate_bytes(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    use flate2::Compression;
+    use flate2::write::DeflateEncoder;
+    use std::io::Write;
+
+    let mut enc = DeflateEncoder::new(Vec::new(), Compression::best());
+    enc.write_all(data)?;
+    enc.finish()
+}
+
+/// 解压 [`deflate_bytes`] 产物，输出规模受 [`BACKUP_MAX_INFLATED`] 约束。
+fn inflate_bytes(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    use flate2::read::DeflateDecoder;
+    use std::io::Read;
+
+    let mut out = Vec::new();
+    DeflateDecoder::new(data)
+        .take(BACKUP_MAX_INFLATED)
+        .read_to_end(&mut out)?;
+    Ok(out)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum BackupError {
@@ -1628,6 +1668,80 @@ mod tests {
         assert_eq!(summary_merge.history_count, 2);
         let history_merged = db2.query_history(10).unwrap();
         assert_eq!(history_merged.len(), 3);
+    }
+
+    /// 载荷压缩要真的省空间，不能只是"加了一层"。
+    #[test]
+    fn backup_payload_is_compressed() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup_file = dir.path().join("compressed.mubc");
+        let mut db = Database::open_in_memory().unwrap();
+
+        // 造一批高度重复的内容，模拟真实剪贴板（大量相似文本）
+        let mut raw_bytes = 0usize;
+        for i in 0..200 {
+            let content = format!(
+                "第 {i} 条：这是一段用于测试压缩率的高度重复文本，包含中文与标点。\
+                 https://example.com/path/to/resource?id={i}&token=abcdefghijklmnop "
+            );
+            raw_bytes += content.len();
+            db.upsert_history(&content, None).unwrap();
+        }
+
+        db.export_encrypted(backup_file.to_str().unwrap(), "pass-123456")
+            .unwrap();
+        let on_disk = std::fs::metadata(&backup_file).unwrap().len() as usize;
+
+        // 明文原始内容约 raw_bytes，压缩 + 加密后应当显著更小
+        assert!(
+            on_disk * 2 < raw_bytes,
+            "压缩没生效：原始 {raw_bytes} 字节，落盘 {on_disk} 字节"
+        );
+    }
+
+    /// v1（未压缩载荷）的旧备份必须还能读——升级不该让人手里的备份作废。
+    #[test]
+    fn v1_uncompressed_backup_still_imports() {
+        use crate::sync::crypto::{derive_backup_key, encrypt_payload_with_aad};
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("legacy-v1.mubc");
+        let password = "legacy-pass-888";
+
+        // 手工按 v1 规范拼一个文件：版本字节 = 1 + 裸 JSON 载荷
+        let payload = EncryptedDatabaseBackup {
+            format_version: 1,
+            exported_at: "2026-01-01T00:00:00Z".to_string(),
+            history: Vec::new(),
+            phrases: Vec::new(),
+            phrase_rules: Vec::new(),
+            phrase_rule_templates: Vec::new(),
+            configs: vec![("theme".to_string(), "dark".to_string())],
+        };
+        let json = serde_json::to_vec(&payload).unwrap();
+
+        let salt = [7u8; 32];
+        let nonce = [9u8; 24];
+        let mut header = [0u8; BACKUP_HEADER_SIZE];
+        header[0..4].copy_from_slice(BACKUP_MAGIC);
+        header[4] = 1; // v1
+        header[8..12].copy_from_slice(&BACKUP_PBKDF2_ROUNDS.to_be_bytes());
+        header[12..44].copy_from_slice(&salt);
+        header[44..68].copy_from_slice(&nonce);
+
+        let key = derive_backup_key(password, &salt, BACKUP_PBKDF2_ROUNDS);
+        let ciphertext = encrypt_payload_with_aad(&key, &nonce, &header, &json).unwrap();
+
+        let mut bytes = header.to_vec();
+        bytes.extend_from_slice(&ciphertext);
+        std::fs::write(&file, &bytes).unwrap();
+
+        let mut db = Database::open_in_memory().unwrap();
+        let summary = db
+            .import_encrypted(file.to_str().unwrap(), password, true)
+            .unwrap();
+        assert_eq!(summary.config_count, 1);
+        assert_eq!(db.get_config("theme").unwrap().as_deref(), Some("dark"));
     }
 
     // ---------------------------------------------------------------

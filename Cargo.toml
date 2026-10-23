@@ -52,6 +52,9 @@ zeroize = { version = "1.8", features = ["zeroize_derive"] }
 subtle = "2.6"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 hmac = "0.12"
+# 备份载荷压缩。强制走纯 Rust 后端（miniz_oxide），不用 C 版本——
+# 否则 Android 交叉编译要多带一份 C 工具链配置，得不偿失。
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
 tempfile = "3"

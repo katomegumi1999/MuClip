@@ -8,7 +8,7 @@
     <img src="https://img.shields.io/badge/rust-2024%20edition-orange.svg" alt="Rust 2024" />
     <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT" />
     <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Android-lightgrey.svg" alt="Platform" />
-    <img src="https://img.shields.io/badge/tests-94%20passing-brightgreen.svg" alt="Tests" />
+    <img src="https://img.shields.io/badge/tests-96%20passing-brightgreen.svg" alt="Tests" />
   </p>
 
   <p>
@@ -84,6 +84,7 @@
 
 - 全量归档历史、常用语、条件规则、规则模板与配置项，打成**一个自包含文件**，换机/重装一条命令复原。
 - 保护口令由用户自设，与库密钥**分离**：PBKDF2-HMAC-SHA256（10 万轮）派生 256 位密钥，XChaCha20-Poly1305 加密。
+- **先 deflate 压缩再加密**（v2 起）。剪贴板文本重复度高，实测落盘只有原始内容的 **9~10%**；解压输出有 512 MiB 上限，防解压炸弹。v1 的旧备份仍可读入。
 - 68 字节文件头（`magic` / 版本 / PBKDF2 轮数 / 32B salt / 24B nonce）**整体作为 AAD**，改版本号或轮数参数即验签失败，堵住降级与参数混淆攻击。
 - 导入两种模式：**增量合并去重**（默认，平滑并入现有数据）与**完全覆盖**（清空后还原）；写盘先落 `.tmp_backup` 再原子 `rename`，中途断电不留半个坏文件。
 - 刻意**排除 `device_id`**：恢复备份不会顶掉目标机的设备身份，避免两台机器 ID 撞车导致同步错乱。
@@ -524,7 +525,7 @@ cargo build --release --target aarch64-linux-android
 ### 测试与基准
 
 ```powershell
-cargo test                     # 94 项测试（87 单元 + 7 集成），含对抗性用例与全链路 PFS 验证
+cargo test                     # 96 项测试（89 单元 + 7 集成），含对抗性用例与全链路 PFS 验证
 cargo run --release --example bench_transfer   # 文件传输基准
 ```
 
