@@ -79,6 +79,14 @@
 - 叠一层 LRU 内存池（默认 100 条 / 5 MB），退出回写，降低磁盘 I/O。
 - 常用语支持**时间规则**（起止时间、插入位置、追加文本）与规则模板。
 
+**💾 单文件加密备份（`.mubc`）**
+
+- 全量归档历史、常用语、条件规则、规则模板与配置项，打成**一个自包含文件**，换机/重装一条命令复原。
+- 保护口令由用户自设，与库密钥**分离**：PBKDF2-HMAC-SHA256（10 万轮）派生 256 位密钥，XChaCha20-Poly1305 加密。
+- 68 字节文件头（`magic` / 版本 / PBKDF2 轮数 / 32B salt / 24B nonce）**整体作为 AAD**，改版本号或轮数参数即验签失败，堵住降级与参数混淆攻击。
+- 导入两种模式：**增量合并去重**（默认，平滑并入现有数据）与**完全覆盖**（清空后还原）；写盘先落 `.tmp_backup` 再原子 `rename`，中途断电不留半个坏文件。
+- 刻意**排除 `device_id`**：恢复备份不会顶掉目标机的设备身份，避免两台机器 ID 撞车导致同步错乱。
+
 **🔌 一套核心，两端接入（非托管原生内存，零解释器/GC抖动）**
 
 - **纯非托管执行**：全部网络 I/O、TCP 连接池、X25519 会话状态与 SQLite 均在 Rust 原生堆运行，完全独立于 C# CLR 与 Android ART 虚拟机，免受 GC 停顿与解释器性能损耗。
@@ -216,6 +224,13 @@ char* json    = muclip_core_query_history(core, 20);   // 调用方负责 muclip
 
 void* sync    = muclip_sync_start("dev-01", "工作站", "windows", 0, 0, "483920");
 char* peers   = muclip_sync_get_active_peers(sync);    // JSON 字符串
+
+// 加密备份：返回 {"history_count":..,"phrase_count":..,...} 的统计摘要，同样需 free_string
+char* exported = muclip_core_export_db(core, "D:/backup/2026-10-23.mubc", "用户自设口令");
+char* restored = muclip_core_import_db(core, "D:/backup/2026-10-23.mubc", "用户自设口令", 0); // 0=增量合并 1=完全覆盖
+
+// 静态加密状态三态查询：1 已加密 / 0 明文 / -1 句柄无效
+int32_t encrypted = muclip_core_is_encrypted(core);
 
 // 零拷贝路径：写入内存池的租借缓冲区（Little-Endian 二进制），用完必须 release
 const uint8_t* ptr; size_t len;
@@ -411,6 +426,25 @@ SPAKE2(Ed25519, 单次性) ──> shared_secret (32B) ───┘
 
 `MSG_FILE_OFFER` 与短消息均使用临时会话密钥加密。即使未来攻击者抓取了完整网络流量并窃取了双方的长期配对密钥（`long_term_key`），由于临时私钥已在内存中抹除，攻击者依然无法推导历史会话密钥、无法解开 `FILE_OFFER`，亦无法还原文件的 `bulk_key`。`tests/file_key_forward_secrecy.rs` 对此提供了严谨的对抗性测试覆盖。
 
+### 本地数据与备份加密
+
+传输层加密和**静态数据**加密是两件独立的事，这里分开说清楚：
+
+| 对象 | 由谁加密 | 现状 |
+| :--- | :--- | :--- |
+| 局域网传输内容 | 本库（临时 X25519 + XChaCha20-Poly1305） | ✅ 始终启用 |
+| `.mubc` 备份文件 | 本库（PBKDF2 10 万轮 → XChaCha20-Poly1305） | ✅ 始终启用，纯 Rust 实现，无外部依赖 |
+| 本地 SQLite 库文件 | SQLCipher（依赖构建特性） | ⚠️ **默认不加密**，见下 |
+
+**关于库文件的静态加密**：`open_with_key` 会先探测 `PRAGMA cipher_version`。当前默认构建用 `rusqlite` 的 `bundled` 特性（普通 SQLite），SQLCipher 未被编译进来，此时 `PRAGMA key` 是一个未知 pragma，**SQLite 会静默忽略**——调用成功返回，数据照旧明文落盘。
+
+这种「看起来加密了、其实没有」是最危险的失败模式，所以本库不再让它静默发生：
+
+- 探测失败时打一条 `WARN` 级别的诊断日志，明说「数据库以明文存储」；
+- 提供 `muclip_core_is_encrypted(handle)` 三态返回（`1` 已加密 / `0` 明文 / `-1` 句柄无效），宿主可以据此在 UI 上如实标注，而不是靠猜。
+
+要真正启用静态加密，需把依赖换成 `rusqlite = { features = ["bundled-sqlcipher"] }`（或 `bundled-sqlcipher-vendored-openssl`），构建会变慢并引入 OpenSSL。这是一项需要公开宣称与验证的工程决策，不在 `0.1.0` 的范围内。
+
 ### 设计取舍（以及为什么）
 
 | 决策 | 原因 |
@@ -496,7 +530,7 @@ MuClip/
 │   ├── ffi/
 │   │   ├── exports/           # C ABI（含 *_pooled 零拷贝变体）
 │   │   └── jni_direct/        # Android JNI 直连
-│   ├── database/              # SQLite：历史、常用语、时间规则、模板
+│   ├── database/              # SQLite：历史、常用语、时间规则、模板 + .mubc 加密备份
 │   ├── cache/                 # LRU 内存热缓存
 │   ├── content/               # 内容类型识别与单行预览
 │   ├── pool/                  # 堆外租借式缓冲区池
