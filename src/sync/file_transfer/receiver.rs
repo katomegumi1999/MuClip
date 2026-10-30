@@ -93,6 +93,11 @@ impl FileTransferManager {
         // 让用户点取消后最多 200ms 就停下（原来要等 30s 读超时）。
         // 真正的「对端死了」判定由 `TRANSFER_IDLE_TIMEOUT` 在辅助函数里维护，
         // 所以这里缩短超时不会把慢速对端误判成断线。
+        //
+        // 注意：**本函数之前**的窗口（服务端读完 PFS 握手、等 offer 帧）仍是
+        // `transport/server.rs` 里 15s 超时的裸读，且不可取消——这不是遗漏：
+        // 那一刻 transfer_id 还没到，系统不知道用户要取消的是哪一次传输。
+        // 该窗口在正常链路上只有几毫秒，恶意对端制造的也不过是 15s 的连接占用。
         let _ = stream.set_read_timeout(Some(super::CANCEL_POLL_INTERVAL));
         let _ = stream.set_write_timeout(Some(super::CANCEL_POLL_INTERVAL));
 

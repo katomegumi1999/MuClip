@@ -2,12 +2,8 @@ mod receiver;
 mod sender;
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
 
 pub const BULK_CHUNK_SIZE: usize = 128 * 1024; // 128 KiB fixed chunk AEAD
 pub const FILE_STREAM_BUFFER_SIZE: usize = BULK_CHUNK_SIZE;
@@ -94,143 +90,13 @@ pub type IncomingFileStreamCallback = Arc<
         + 'static,
 >;
 
-/// 单次传输的取消令牌。
+/// 取消原语已上移到 [`crate::sync::cancel`]：PFS 会话握手（transport 层）也要用
+/// 同一套机制，而 transport 是 file_transfer 的下层，不能反过来依赖它。
 ///
-/// 只有 `AtomicBool` 是不够的：传输线程可能正阻塞在 `read_exact` / `write_all`
-/// 上（对端不发数据、或接收端不读 socket），此时它根本没机会回到循环开头去检查
-/// 标志位。所以真正让取消生效的是下面那对 `*_cancellable` IO 辅助函数里的
-/// 「短超时轮询」。
-///
-/// **为什么不用 `shutdown()` 打断阻塞读**：Windows 上 `shutdown()` 只会改变 socket
-/// 状态，**不会唤醒已经阻塞在 `recv()` 上的调用**（Linux 会）。实测对一个
-/// `try_clone()` 出来的句柄调用 `shutdown(Both)`，阻塞中的 read 依然要等到对端发
-/// 数据或读超时才返回。因此这里走跨平台一致的超时轮询，不依赖 shutdown 的语义差异。
-pub(super) struct CancelToken {
-    flag: Arc<AtomicBool>,
-}
-
-impl CancelToken {
-    fn new() -> Self {
-        Self {
-            flag: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    pub(super) fn is_cancelled(&self) -> bool {
-        self.flag.load(Ordering::SeqCst)
-    }
-
-    /// 置位取消标志。真正的停止动作发生在下一次 IO 轮询检查时。
-    fn cancel(&self) {
-        self.flag.store(true, Ordering::SeqCst);
-    }
-}
-
-/// 取消轮询间隔：每次读写超时后都会回来检查一次取消标志。
-/// 直接决定用户点「取消」到真正停下的延迟上限。
-const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(200);
-
-/// 相邻两次「有进展」之间允许的最长空闲时间。
-///
-/// 超时轮询只是为了能感知取消，**不能**把「对端死了」的判定缩短到 200ms，
-/// 否则慢速对端会被误判成断线。真正的活死判定仍用这个值（与原 30s 读超时一致）。
-const TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// 可取消 IO 的失败原因。
-///
-/// 必须把 `Cancelled` 和真正的 IO 失败区分开：取消是我们自己触发的，若上报成
-/// 网络错误，上层会提示「传输失败，请检查网络」，把一次正常操作说成事故。
-pub(super) enum IoAbort {
-    Cancelled,
-    Io(std::io::Error),
-}
-
-/// 超时类错误：Windows 返回 `TimedOut`（WSAETIMEDOUT），Unix 返回 `WouldBlock`。
-fn is_poll_timeout(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-    )
-}
-
-/// `read_exact` 的可取消版本：保证读满 `buf`，但每 `CANCEL_POLL_INTERVAL` 回来
-/// 检查一次取消标志。
-///
-/// 不能直接用 `read_exact` + 短超时：`read_exact` 中途超时会丢失「已经读了多少」，
-/// 这部分数据就永久错位了（后续 chunk 全部解密失败）。所以这里自己维护 `filled`。
-fn read_exact_cancellable(
-    stream: &mut TcpStream,
-    buf: &mut [u8],
-    cancel: &CancelToken,
-) -> Result<(), IoAbort> {
-    let mut filled = 0usize;
-    let mut last_progress = Instant::now();
-    while filled < buf.len() {
-        if cancel.is_cancelled() {
-            return Err(IoAbort::Cancelled);
-        }
-        match stream.read(&mut buf[filled..]) {
-            Ok(0) => {
-                return Err(IoAbort::Io(std::io::Error::from(
-                    std::io::ErrorKind::UnexpectedEof,
-                )));
-            }
-            Ok(n) => {
-                filled += n;
-                last_progress = Instant::now();
-            }
-            Err(ref e) if is_poll_timeout(e) => {
-                if last_progress.elapsed() >= TRANSFER_IDLE_TIMEOUT {
-                    return Err(IoAbort::Io(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "peer idle timeout: no data for 30s",
-                    )));
-                }
-                // 继续下一轮 —— 回到循环顶部就会检查取消标志
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(IoAbort::Io(e)),
-        }
-    }
-    Ok(())
-}
-
-/// `write_all` 的可取消版本。语义与 `read_exact_cancellable` 对称。
-fn write_all_cancellable(
-    stream: &mut TcpStream,
-    buf: &[u8],
-    cancel: &CancelToken,
-) -> Result<(), IoAbort> {
-    let mut written = 0usize;
-    let mut last_progress = Instant::now();
-    while written < buf.len() {
-        if cancel.is_cancelled() {
-            return Err(IoAbort::Cancelled);
-        }
-        match stream.write(&buf[written..]) {
-            Ok(0) => {
-                return Err(IoAbort::Io(std::io::Error::from(
-                    std::io::ErrorKind::WriteZero,
-                )));
-            }
-            Ok(n) => {
-                written += n;
-                last_progress = Instant::now();
-            }
-            Err(ref e) if is_poll_timeout(e) => {
-                if last_progress.elapsed() >= TRANSFER_IDLE_TIMEOUT {
-                    return Err(IoAbort::Io(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "peer not reading: write stalled for 30s",
-                    )));
-                }
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(IoAbort::Io(e)),
-        }
-    }
-    Ok(())
-}
+/// 这里保留同名重导出，子模块（sender / receiver）继续用 `super::XXX` 引用。
+pub(crate) use crate::sync::cancel::{
+    CANCEL_POLL_INTERVAL, CancelToken, IoAbort, read_exact_cancellable, write_all_cancellable,
+};
 
 #[derive(Default)]
 pub struct FileTransferManager {
@@ -436,7 +302,7 @@ mod tests {
     use crate::sync::crypto::derive_key;
     use crate::sync::protocol::{FileOfferPayload, HEADER_SIZE, SyncHeader};
     use std::io::Read;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     /// 回归测试：在回调内部重新设置同一个回调不得死锁。
@@ -886,6 +752,76 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "取消耗时 {:?}，远超预期（修复前是 30s 读超时）",
+            elapsed
+        );
+
+        let _ = stop_tx.send(());
+        let _ = server.join();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// 取消必须能打断**PFS 握手阶段**的阻塞读。
+    ///
+    /// 真实场景：对端 TCP 连接已建立（`connect_timeout` 成功），但进程卡死或
+    /// 干脆是恶意的，一个字节的 `SESSION_RESP` 都不回。修复前握手走的是
+    /// transport 层的裸 `read_exact` + 30s 读超时，用户点「取消」后要等满 30s
+    /// （多轮往返最坏可达一分多钟）才生效——这是"点取消没反应"投诉的主因。
+    ///
+    /// 这条测试同时守住接线本身：`execute_pfs_client_handshake_cancellable` 必须
+    /// 真的拿到 cancel_flag，而不是签名叫可取消、内部还在用裸 read_exact。
+    #[test]
+    fn cancel_interrupts_sender_blocked_in_pfs_handshake() {
+        let key = derive_key("cancel_handshake_pin", None).unwrap();
+        let temp_dir =
+            std::env::temp_dir().join(format!("muclip_cancel_hs_{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let src = temp_dir.join("payload.bin");
+        std::fs::write(&src, vec![0x22u8; 256 * 1024]).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // 对端 accept 后彻底静默：不读也不写，发送端会卡在等 SESSION_RESP 上。
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let Ok((_stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = stop_rx.recv_timeout(Duration::from_secs(10));
+        });
+
+        let mgr = Arc::new(FileTransferManager::new(&temp_dir));
+        let mgr_send = Arc::clone(&mgr);
+        let src_path = src.to_string_lossy().to_string();
+        let peer = format!("127.0.0.1:{}", port);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = mgr_send.send_file("hs_tid", &peer, &src_path, "devA", "A", &key);
+            let _ = done_tx.send(r);
+        });
+
+        // 留时间让发送端完成 connect 并阻塞在握手读上
+        std::thread::sleep(Duration::from_millis(400));
+
+        let t0 = std::time::Instant::now();
+        assert!(
+            mgr.cancel_transfer("hs_tid"),
+            "取消请求应命中在途传输（说明 token 在连接前就已注册）"
+        );
+        let res = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("取消后握手必须尽快返回；这里超时说明握手阶段没有接上可取消 IO");
+        let elapsed = t0.elapsed();
+
+        let err = res.expect_err("被取消的握手不应返回成功");
+        assert!(
+            err.contains("canceled"),
+            "取消应被识别成「已取消」，实际错误: {}",
+            err
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "取消耗时 {:?}，远超预期（修复前要等 30s 握手读超时）",
             elapsed
         );
 

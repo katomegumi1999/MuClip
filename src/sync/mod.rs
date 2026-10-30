@@ -1,3 +1,4 @@
+pub(crate) mod cancel;
 pub mod crypto;
 pub mod discovery;
 pub mod file_transfer;

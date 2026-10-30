@@ -209,29 +209,35 @@ impl FileTransferManager {
             .map_err(|e| format!("Failed to connect to {}: {}", peer_addr, e))?;
 
         let mut stream: TcpStream = socket.into();
-        // PFS 握手用的是 transport 层的 `read_exact`，它不认识「200ms 轮询」的约定，
-        // 所以握手阶段先维持 30s 超时；握手完成后再切到可取消的短超时。
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+
+        // ⚠️ 连接阶段（`connect_timeout`）本身不可取消，上限 10s 是刻意接受的成本：
+        // 非阻塞 connect + 轮询能省掉这 10s，但复杂度与平台差异（WSAEINPROGRESS /
+        // 错误码映射）不成比例，而真正的病灶是握手——对端 accept 后一言不发时，
+        // 旧实现要等满 30s/轮次，最长可达一分多钟。
+        //
+        // 因此从握手开始就把超时压到轮询间隔，让每一步 IO 都能在 200ms 内响应取消。
+        // 「对端死了」的判定由 `TRANSFER_IDLE_TIMEOUT`（30s 无进展）负责，
+        // 不会被这次缩短影响。
+        let _ = stream.set_read_timeout(Some(super::CANCEL_POLL_INTERVAL));
+        let _ = stream.set_write_timeout(Some(super::CANCEL_POLL_INTERVAL));
 
         // Negotiate PFS session key on dedicated bulk stream (Mandatory)
-        let active_session_key = crate::sync::transport::execute_pfs_client_handshake(
+        let active_session_key = crate::sync::transport::execute_pfs_client_handshake_cancellable(
             &mut stream,
             local_id,
             target_device_id,
             session_key,
             1,
+            &cancel_flag,
         )
-        .map_err(|e| format!("PFS session handshake failed for {}: {}", peer_addr, e))?;
+        .map_err(|e| match e {
+            crate::sync::transport::TransportError::Cancelled => {
+                "Transfer canceled by sender".to_string()
+            }
+            other => format!("PFS session handshake failed for {}: {}", peer_addr, other),
+        })?;
 
-        // 握手完成，从这里开始所有阻塞 IO 都走可取消版本。
-        // 把超时压到轮询间隔，用户点取消后最多 200ms 就停下；「对端死了」的判定
-        // 由 `TRANSFER_IDLE_TIMEOUT` 维护，不会被这次缩短影响。
-        //
-        // 注：握手阶段（通常 <1s）本身仍是不可取消的，取消要等握手返回才会被感知。
-        // 这里刻意不为了那不到 1s 的阶段去改 transport 层的握手代码。
-        let _ = stream.set_read_timeout(Some(super::CANCEL_POLL_INTERVAL));
-        let _ = stream.set_write_timeout(Some(super::CANCEL_POLL_INTERVAL));
+        // 握手完成，后续所有阻塞 IO 继续走同一套短超时 + 可取消约定。
 
         // Generate a 16-byte random file nonce (stream salt) for deterministic chunk nonces
         let mut stream_salt = [0u8; 16];

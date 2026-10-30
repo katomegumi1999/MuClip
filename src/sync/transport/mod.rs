@@ -2,6 +2,7 @@ pub mod client;
 pub mod pairing;
 pub mod server;
 
+pub(crate) use client::execute_pfs_client_handshake_cancellable;
 pub use client::{SyncClient, execute_pfs_client_handshake};
 pub use server::SyncServer;
 
@@ -62,6 +63,54 @@ pub(crate) fn read_framed_packet(
     stream.read_exact(&mut raw_packet[HEADER_SIZE..])?;
 
     Ok((header, raw_packet))
+}
+
+/// [`read_framed_packet`] 的可取消版本，供 PFS 握手使用。
+///
+/// 握手阶段没有 transfer_id 可查，用户点「取消」时只能靠令牌打断阻塞读。
+/// 与数据阶段的约定一致：调用方必须先把 socket 读写超时压到
+/// [`crate::sync::cancel::CANCEL_POLL_INTERVAL`]，否则一次 `read` 就会阻塞到长超时。
+///
+/// 头与载荷分两次读（载荷长度由头解析得出），因此对端正好卡在帧边界时，
+/// 空闲计时会重置一次，最坏 2×`TRANSFER_IDLE_TIMEOUT` 才判定对端已死。
+pub(crate) fn read_framed_packet_cancellable(
+    stream: &mut TcpStream,
+    max_payload_size: usize,
+    cancel: &crate::sync::cancel::CancelToken,
+) -> Result<(SyncHeader, Vec<u8>), TransportError> {
+    use crate::sync::cancel::read_exact_cancellable_split;
+
+    let mut header_buf = [0u8; HEADER_SIZE];
+    {
+        let mut parts: [&mut [u8]; 1] = [&mut header_buf];
+        read_exact_cancellable_split(stream, &mut parts, cancel).map_err(abort_to_transport)?;
+    }
+
+    let header = SyncHeader::parse(&header_buf)?;
+    let payload_len = header.payload_len as usize;
+    if payload_len > max_payload_size {
+        return Err(TransportError::PayloadTooLarge(
+            payload_len,
+            max_payload_size,
+        ));
+    }
+
+    let mut raw_packet = vec![0u8; HEADER_SIZE + payload_len];
+    raw_packet[..HEADER_SIZE].copy_from_slice(&header_buf);
+    {
+        let mut parts: [&mut [u8]; 1] = [&mut raw_packet[HEADER_SIZE..]];
+        read_exact_cancellable_split(stream, &mut parts, cancel).map_err(abort_to_transport)?;
+    }
+
+    Ok((header, raw_packet))
+}
+
+/// 把可取消 IO 的失败原因翻译成 [`TransportError`]，保留「用户取消」这一语义。
+pub(crate) fn abort_to_transport(abort: crate::sync::cancel::IoAbort) -> TransportError {
+    match abort {
+        crate::sync::cancel::IoAbort::Cancelled => TransportError::Cancelled,
+        crate::sync::cancel::IoAbort::Io(e) => TransportError::Io(e),
+    }
 }
 
 /// 与 [`read_framed_packet`] 行为一致，但把帧数据读进调用方提供的可复用缓冲区。
@@ -130,6 +179,9 @@ pub enum TransportError {
     NotPairedByPeer,
     #[error("Sync rejected by peer")]
     SyncRejected,
+    /// 用户主动取消（不是故障）。上层据此提示「已取消」而非「传输失败」。
+    #[error("Operation canceled by user")]
+    Cancelled,
 }
 
 /// Thread-safe bounded cache to prevent loopback broadcast loops and redundant syncs.

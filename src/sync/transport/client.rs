@@ -23,12 +23,61 @@ pub struct SyncClient {
     connection_pool: Arc<Mutex<HashMap<String, PooledConnection>>>,
 }
 
+/// PFS 会话握手（不可取消版本）。
+///
+/// 剪贴板同步这类「必须立刻完成或立刻失败」的场景用它：调用方已经把读写超时
+/// 压到几秒，没有用户可点的取消按钮。大文件传输请用
+/// [`execute_pfs_client_handshake_cancellable`]。
 pub fn execute_pfs_client_handshake(
     stream: &mut TcpStream,
     local_device_id: &str,
     target_device_id: Option<&str>,
     long_term_key: &[u8; KEY_SIZE],
     seq: u64,
+) -> Result<zeroize::Zeroizing<[u8; KEY_SIZE]>, TransportError> {
+    execute_pfs_client_handshake_inner(
+        stream,
+        local_device_id,
+        target_device_id,
+        long_term_key,
+        seq,
+        None,
+    )
+}
+
+/// PFS 会话握手（可取消版本）。
+///
+/// **调用前提**：socket 的读写超时已压到
+/// [`crate::sync::cancel::CANCEL_POLL_INTERVAL`]，否则单次 `read` 会阻塞到长超时，
+/// 令牌形同虚设。
+///
+/// 修复的是这样一类事故：对端完成 TCP 连接后一言不发（进程卡死 / 恶意），
+/// 用户点「取消」却要等握手超时才生效——之前每个往返 30s，最多可达一分多钟。
+pub(crate) fn execute_pfs_client_handshake_cancellable(
+    stream: &mut TcpStream,
+    local_device_id: &str,
+    target_device_id: Option<&str>,
+    long_term_key: &[u8; KEY_SIZE],
+    seq: u64,
+    cancel: &crate::sync::cancel::CancelToken,
+) -> Result<zeroize::Zeroizing<[u8; KEY_SIZE]>, TransportError> {
+    execute_pfs_client_handshake_inner(
+        stream,
+        local_device_id,
+        target_device_id,
+        long_term_key,
+        seq,
+        Some(cancel),
+    )
+}
+
+fn execute_pfs_client_handshake_inner(
+    stream: &mut TcpStream,
+    local_device_id: &str,
+    target_device_id: Option<&str>,
+    long_term_key: &[u8; KEY_SIZE],
+    seq: u64,
+    cancel: Option<&crate::sync::cancel::CancelToken>,
 ) -> Result<zeroize::Zeroizing<[u8; KEY_SIZE]>, TransportError> {
     let key_ex = crate::sync::crypto::KeyExchangeSession::new();
     let client_pk = key_ex.public_key;
@@ -55,10 +104,21 @@ pub fn execute_pfs_client_handshake(
     };
 
     let init_pkt = crate::sync::protocol::encode_session_init_packet(seq, &init_payload)?;
-    stream.write_all(&init_pkt)?;
+    match cancel {
+        Some(token) => {
+            crate::sync::cancel::write_all_cancellable(stream, &init_pkt, token)
+                .map_err(super::abort_to_transport)?;
+        }
+        None => stream.write_all(&init_pkt)?,
+    }
     stream.flush()?;
 
-    let (resp_header, mut resp_raw) = super::read_framed_packet(stream, super::MAX_PAYLOAD_SIZE)?;
+    let (resp_header, mut resp_raw) = match cancel {
+        Some(token) => {
+            super::read_framed_packet_cancellable(stream, super::MAX_PAYLOAD_SIZE, token)?
+        }
+        None => super::read_framed_packet(stream, super::MAX_PAYLOAD_SIZE)?,
+    };
     if resp_header.msg_type != crate::sync::protocol::MSG_SESSION_RESP {
         return Err(TransportError::SyncRejected);
     }
