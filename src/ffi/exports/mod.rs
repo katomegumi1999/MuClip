@@ -62,6 +62,67 @@ mod tests {
         }
     }
 
+    /// 结构化搜索的 FFI 往返：JSON 请求 → 池化二进制 → count。
+    ///
+    /// C# 侧依赖 `muclip_core_search_history_page_pooled` 与
+    /// `muclip_core_search_history_count` 两个新符号，符号缺失会在宿主运行期抛
+    /// EntryPointNotFoundException（编译期发现不了），所以这里必须覆盖。
+    #[test]
+    fn test_pooled_search_page_and_count_with_types() {
+        unsafe {
+            let handle = muclip_core_new_in_memory();
+            for s in ["普通文本一", "普通文本二", "https://example.com/a"] {
+                let c = CString::new(s).unwrap();
+                assert!(muclip_core_add_history(handle, c.as_ptr()) > 0);
+            }
+
+            let mut out_ptr: *const u8 = std::ptr::null();
+            let mut out_len: usize = 0;
+
+            // 只要 URL（类型编号 1）
+            let url_only =
+                CString::new(r#"{"query":"","types":[1],"offset":0,"limit":50}"#).unwrap();
+            let lease = muclip_core_search_history_page_pooled(
+                handle,
+                url_only.as_ptr(),
+                &mut out_ptr,
+                &mut out_len,
+            );
+            assert!(lease > 0, "分页搜索应当返回有效租约");
+            let slice = std::slice::from_raw_parts(out_ptr, out_len);
+            let count = u32::from_le_bytes(slice[0..4].try_into().unwrap());
+            assert_eq!(count, 1, "类型筛选应当只回传那条 URL");
+            assert_eq!(muclip_pool_release(lease), 0);
+
+            assert_eq!(
+                muclip_core_search_history_count(handle, url_only.as_ptr()),
+                1
+            );
+
+            let all = CString::new(r#"{"query":"","types":[],"offset":0,"limit":50}"#).unwrap();
+            assert_eq!(muclip_core_search_history_count(handle, all.as_ptr()), 3);
+
+            // 关键词按字面量匹配：搜 % 不能命中全部
+            let pct = CString::new(r#"{"query":"%","types":[],"offset":0,"limit":50}"#).unwrap();
+            assert_eq!(muclip_core_search_history_count(handle, pct.as_ptr()), 0);
+
+            // 非法 JSON 退化成「无条件分页」，不能让调用方拿到空租约而误判成「无结果」
+            let bad = CString::new("{not json").unwrap();
+            let lease2 = muclip_core_search_history_page_pooled(
+                handle,
+                bad.as_ptr(),
+                &mut out_ptr,
+                &mut out_len,
+            );
+            assert!(lease2 > 0);
+            let slice2 = std::slice::from_raw_parts(out_ptr, out_len);
+            assert_eq!(u32::from_le_bytes(slice2[0..4].try_into().unwrap()), 3);
+            assert_eq!(muclip_pool_release(lease2), 0);
+
+            muclip_core_free(handle);
+        }
+    }
+
     #[test]
     fn test_memory_pool_lease_and_pooled_queries() {
         unsafe {

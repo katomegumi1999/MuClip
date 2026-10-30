@@ -266,7 +266,10 @@ impl DiscoveryService {
                     },
                 };
 
-                let _ = socket.set_read_timeout(Some(Duration::from_millis(1000)));
+                // 读超时决定 stop() 时 join 本线程的最坏等待（recv_from 阻塞到超时才检查退出标志）。
+                // 曾经是 1000ms：退出路径上托盘图标会因此残留近 1 秒（实测 discovery.stop 530ms）。
+                // 150ms 的空转唤醒开销可忽略，却把退出延迟上限压到 1/6。
+                let _ = socket.set_read_timeout(Some(Duration::from_millis(150)));
                 let mut buf = [0u8; 4096];
                 let mut last_prune = Instant::now();
                 let mut last_unicast_reply: HashMap<Ipv4Addr, Instant> = HashMap::new();

@@ -209,6 +209,68 @@ pub unsafe extern "C" fn muclip_core_search_history_pooled(
     0
 }
 
+/// 分页搜索历史（结构化请求）。
+///
+/// `request_json` 形如 `{"query":"报告","types":[1],"offset":0,"limit":200}`，
+/// 三个维度正交：字面量关键词 / 内容类型白名单（空=不限）/ 分页。
+/// 返回的仍是历史条目的二进制流（格式与 `muclip_core_search_history_pooled` 一致），
+/// 命中总数请另调 `muclip_core_search_history_count`。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn muclip_core_search_history_page_pooled(
+    handle: *mut MuClipCoreHandle,
+    request_json: *const c_char,
+    out_ptr: *mut *const u8,
+    out_len: *mut usize,
+) -> u64 {
+    if handle.is_null() || out_ptr.is_null() || out_len.is_null() {
+        return 0;
+    }
+    let raw = match unsafe { c_char_to_str(request_json) } {
+        Some(text) => text,
+        None => return 0,
+    };
+    // 请求体解析失败就当成「无条件分页」而不是整体失败：搜索框里打错字不该让列表空白。
+    let req: crate::database::HistorySearch = serde_json::from_str(raw).unwrap_or_default();
+
+    let engine_guard = unsafe { &*handle };
+    if let Ok(engine) = engine_guard.inner.lock() {
+        let items = engine.db.search_history_page(&req).unwrap_or_default();
+        if let Some((id, ptr, len)) =
+            write_binary_to_pooled_buffer(|buf| encode_history_items(&items, buf))
+        {
+            unsafe {
+                *out_ptr = ptr;
+                *out_len = len;
+            }
+            return id;
+        }
+    }
+    0
+}
+
+/// 搜索命中总数（不受分页 limit 影响）。返回负数表示失败。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn muclip_core_search_history_count(
+    handle: *mut MuClipCoreHandle,
+    request_json: *const c_char,
+) -> i64 {
+    if handle.is_null() {
+        return -1;
+    }
+    let raw = match unsafe { c_char_to_str(request_json) } {
+        Some(text) => text,
+        None => return -1,
+    };
+    let req: crate::database::HistorySearch = serde_json::from_str(raw).unwrap_or_default();
+    let engine_guard = unsafe { &*handle };
+    if let Ok(engine) = engine_guard.inner.lock() {
+        if let Ok(n) = engine.db.search_history_count(&req) {
+            return n as i64;
+        }
+    }
+    -1
+}
+
 /// Analyzes content and writes Little-Endian binary wire format into a leased memory pool buffer.
 /// Returns `lease_id`. Caller must release via `muclip_pool_release(lease_id)`.
 #[unsafe(no_mangle)]

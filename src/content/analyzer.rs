@@ -37,6 +37,32 @@ impl ContentType {
             _ => ContentType::PlainText,
         }
     }
+
+    /// 数据库内以整数存储（比字符串省 9 字节/行，且可建复合索引）。
+    /// 编号一旦发布不得改动——它是落盘格式的一部分。
+    pub fn to_db_i64(&self) -> i64 {
+        match self {
+            ContentType::PlainText => 0,
+            ContentType::Url => 1,
+            ContentType::Email => 2,
+            ContentType::HexColor => 3,
+            ContentType::Json => 4,
+            ContentType::Code => 5,
+            ContentType::Number => 6,
+        }
+    }
+
+    pub fn from_db_i64(v: i64) -> Self {
+        match v {
+            1 => ContentType::Url,
+            2 => ContentType::Email,
+            3 => ContentType::HexColor,
+            4 => ContentType::Json,
+            5 => ContentType::Code,
+            6 => ContentType::Number,
+            _ => ContentType::PlainText,
+        }
+    }
 }
 
 #[derive(uniffi::Record, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -767,6 +767,48 @@ impl Drop for MuClipSyncEngine {
 mod tests {
     use super::*;
 
+    /// 退出延迟回归：发现广播线程用 100ms tick、监听线程 1s 读超时，
+    /// server accept 线程由回环连接唤醒。stop() 若超过 500ms，退出路径上的
+    /// 托盘图标 / 进程残留就会被用户感知（参见 ShawMuOCR 的退出预算设计）。
+    #[test]
+    fn test_stop_latency_is_bounded() {
+        let config = SyncConfig {
+            device_id: "latency-node".into(),
+            device_name: "Latency Node".into(),
+            device_type: "Windows".into(),
+            sync_port: 0,
+            discovery_port: 0,
+            pairing_pin: "123456".into(),
+        };
+
+        let engine = MuClipSyncEngine::start(config).expect("start engine");
+        // 进入稳态：广播循环已跑过前 2 次（2s 间隔档），监听线程阻塞在 recv 上
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+
+        let t = std::time::Instant::now();
+        engine.discovery.stop();
+        let discovery_ms = t.elapsed().as_millis();
+
+        let t = std::time::Instant::now();
+        engine.server.stop();
+        let server_ms = t.elapsed().as_millis();
+
+        println!(
+            "stop latency: discovery={} ms, server={} ms",
+            discovery_ms, server_ms
+        );
+        assert!(
+            discovery_ms < 300,
+            "discovery.stop 过慢: {} ms（监听线程读超时过长？）",
+            discovery_ms
+        );
+        assert!(
+            server_ms < 300,
+            "server.stop 过慢: {} ms（accept 唤醒失效？）",
+            server_ms
+        );
+    }
+
     #[test]
     fn test_sync_engine_lifecycle() {
         let config = SyncConfig {

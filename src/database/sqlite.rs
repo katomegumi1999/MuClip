@@ -1,9 +1,157 @@
 use crate::content::{ContentType, analyze_content};
-use chrono::Local;
+use chrono::{Local, NaiveDateTime, TimeZone};
 use rusqlite::{Connection, Result, params};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use uuid::Uuid;
+
+/// 当前 schema 版本，写入 `PRAGMA user_version`。
+///
+/// 历史：
+/// - 0：无版本号的旧库（`clipboard_history` / `phrases` 表，时间戳为 TEXT，全列正文索引）
+/// - 2：整数时间戳 + 内容哈希去重索引 + 整数内容类型 + 收藏位 + 来源位
+///
+/// 改动 schema 必须 bump 本常量并在 [`Database::migrate`] 里补一段升级分支。
+const SCHEMA_VERSION: i64 = 2;
+
+/// 时间戳格式。落盘用整数（unix 秒），跨 FFI 边界仍用这个字符串以保持宿主不变。
+const TS_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+
+fn now_ts() -> i64 {
+    Local::now().timestamp()
+}
+
+/// 整数时间戳 → 宿主可见字符串。
+fn fmt_ts(ts: i64) -> String {
+    Local
+        .timestamp_opt(ts, 0)
+        .single()
+        .unwrap_or_else(Local::now)
+        .format(TS_FORMAT)
+        .to_string()
+}
+
+/// 宿主传入的字符串时间戳 → 整数。解析失败时退回当前时间（不因一个坏时间戳丢整条记录）。
+fn parse_ts(s: &str) -> i64 {
+    NaiveDateTime::parse_from_str(s.trim(), TS_FORMAT)
+        .map(|dt| {
+            Local
+                .from_local_datetime(&dt)
+                .single()
+                .map(|v| v.timestamp())
+        })
+        .ok()
+        .flatten()
+        .unwrap_or_else(now_ts)
+}
+
+/// 内容指纹：SHA-256 截断到 128 位。
+///
+/// 用途是**去重索引**：直接对正文建索引会把整段文本在索引里再存一遍（实测占库文件 47%），
+/// 改用固定 16 字节的哈希后索引体积降两个数量级，查找也从逐字符比较变成整数比较。
+/// 128 位足以让"两条不同内容撞哈希"在实际规模下不可能发生（10^5 条量级碰撞概率 ~1e-28）；
+/// 即便如此，去重路径仍会二次比对正文，碰撞只会退化成"多插一条"，不会丢数据。
+fn hash_content(content: &str) -> [u8; 16] {
+    let digest = Sha256::digest(content.as_bytes());
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest[..16]);
+    out
+}
+
+/// 把用户输入的搜索词包成 LIKE 模式，并转义 LIKE 的元字符。
+///
+/// 不转义会有真实的错误行为：搜 `%` 会命中全部记录（`%%%`），搜 `_` 会变成
+/// "任意单字符"匹配，搜 `\`（不加 ESCAPE 时）视版本可能报错或吞掉。
+/// 用户搜什么就该按字面量匹配什么。
+fn like_pattern(query: &str) -> String {
+    let mut out = String::with_capacity(query.len() + 2);
+    out.push('%');
+    for ch in query.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('%');
+    out
+}
+
+/// LIKE 子句与其 ESCAPE 声明必须成对出现，故集中在这里。
+const LIKE_ESCAPE: &str = r"ESCAPE '\'";
+
+/// 历史搜索请求。
+///
+/// 三个维度正交：`query` 是字面量子串、`types` 是内容类型白名单（空 = 不限）、
+/// `offset/limit` 是分页。**类型筛选必须下推到 SQL**，否则「先取 500 条再在内存里过滤」
+/// 会让结果残缺：库里明明有 200 条链接，可能前 500 条里一条都没有。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct HistorySearch {
+    #[serde(default)]
+    pub query: String,
+    /// 内容类型编号（`ContentType::to_db_i64` 的值）。空表示不限。
+    #[serde(default)]
+    pub types: Vec<i64>,
+    #[serde(default)]
+    pub offset: usize,
+    /// 每页条数。**0 或缺失都按 [`DEFAULT_SEARCH_LIMIT`] 处理**，
+    /// 免得宿主漏传一个字段就拿到空列表、把「没传」误读成「没有结果」。
+    #[serde(default)]
+    pub limit: usize,
+}
+
+impl Default for HistorySearch {
+    fn default() -> Self {
+        Self {
+            query: String::new(),
+            types: Vec::new(),
+            offset: 0,
+            limit: DEFAULT_SEARCH_LIMIT,
+        }
+    }
+}
+
+/// 单次搜索返回条数的上限。防止宿主传一个荒谬的 limit 把内存打爆。
+const SEARCH_MAX_LIMIT: usize = 2000;
+/// 未指定 limit 时的每页条数。
+const DEFAULT_SEARCH_LIMIT: usize = 200;
+
+/// 内容指纹的对外别名。
+///
+/// 内存缓存也用它做去重：缓存里塞的常常是几十上百 KB 的正文，
+/// 每条都比一遍 `str` 太浪费，先比 16 字节指纹就能筛掉绝大多数候选。
+pub fn content_fingerprint(content: &str) -> [u8; 16] {
+    hash_content(content)
+}
+
+/// 读取时间戳列：新库是 INTEGER，旧库（迁移过程中）是 TEXT，两种都要认。
+fn ts_column(row: &rusqlite::Row<'_>, idx: usize) -> i64 {
+    match row.get::<_, i64>(idx) {
+        Ok(v) => v,
+        Err(_) => row
+            .get::<_, String>(idx)
+            .map(|s| parse_ts(&s))
+            .unwrap_or_else(|_| now_ts()),
+    }
+}
+
+// 旧库（schema v0）搬运时的行缓冲类型。列多且形态各异，
+// 单独起名比在 `let rows: Vec<(...)>` 处堆十行更易读。
+type LegacyPhraseRow = (
+    i64,            // id
+    String,         // content
+    Option<String>, // content_type（旧库存的是字符串）
+    Option<i64>,    // char_count
+    Option<i64>,    // line_count
+    Option<i64>,    // byte_count
+    Option<String>, // preview
+    i64,            // sort_order
+    i64,            // created_at
+    i64,            // last_used_at
+);
+type LegacyRuleRow = (String, i64, i32, i64, i32, String, String, String, i64);
+type LegacyTemplateRow = (String, String, i64, i32, String, String, String, i64);
+type LegacyConfigRow = (String, String, i64);
 
 #[derive(uniffi::Record, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryItem {
@@ -245,7 +393,8 @@ impl Database {
             conn,
             encryption_active,
         };
-        if let Err(e) = db.init_tables() {
+        db.configure_pragmas(true)?;
+        if let Err(e) = db.migrate() {
             // 首次读取才是校验密钥的时机，所以「密钥不对 / 库不是本密钥的」都报在这一步，
             // 原生错误信息只有一句 file is not a database，宿主看不出所以然。
             if encryption_active {
@@ -266,7 +415,8 @@ impl Database {
             conn,
             encryption_active: false,
         };
-        db.init_tables()?;
+        db.configure_pragmas(false)?;
+        db.migrate()?;
         Ok(db)
     }
 
@@ -277,162 +427,429 @@ impl Database {
         self.encryption_active
     }
 
-    fn init_tables(&self) -> Result<()> {
+    /// 连接级 PRAGMA。
+    ///
+    /// WAL 让「读」与「写」不再互斥（界面读列表时剪贴板监听线程仍能写入），
+    /// `auto_vacuum=INCREMENTAL` 保证清空历史后文件能缩回去（旧的 delete 模式永远不缩）。
+    /// `auto_vacuum` 必须在新库建表之前设置才生效；对已有库则要等一次 VACUUM，
+    /// 迁移流程结尾正好会做这件事。
+    fn configure_pragmas(&self, is_file: bool) -> Result<()> {
         self.conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS clipboard_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                content TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                last_used_at TEXT NOT NULL,
-                content_type TEXT,
-                char_count INTEGER,
-                line_count INTEGER,
-                byte_count INTEGER,
-                preview TEXT
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_history_last_used 
-                ON clipboard_history(last_used_at DESC);
-
-            CREATE INDEX IF NOT EXISTS idx_history_content 
-                ON clipboard_history(content);
-
-            CREATE TABLE IF NOT EXISTS phrases (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                content TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                last_used_at TEXT NOT NULL,
-                sort_order INTEGER DEFAULT 0,
-                content_type TEXT,
-                char_count INTEGER,
-                line_count INTEGER,
-                byte_count INTEGER,
-                preview TEXT
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_phrases_sort 
-                ON phrases(sort_order ASC, last_used_at DESC);
-
-            CREATE TABLE IF NOT EXISTS secure_config (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS phrase_rules (
-                id TEXT PRIMARY KEY,
-                phrase_id INTEGER NOT NULL,
-                is_enabled INTEGER NOT NULL DEFAULT 1,
-                insert_position INTEGER NOT NULL DEFAULT 0,
-                position_mode INTEGER NOT NULL DEFAULT 1,
-                start_time TEXT NOT NULL,
-                end_time TEXT NOT NULL,
-                append_text TEXT NOT NULL,
-                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-                FOREIGN KEY(phrase_id) REFERENCES phrases(id) ON DELETE CASCADE
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_phrase_rules_phrase_id 
-                ON phrase_rules(phrase_id);
-
-            CREATE TABLE IF NOT EXISTS phrase_rule_templates (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                insert_position INTEGER NOT NULL DEFAULT 0,
-                position_mode INTEGER NOT NULL DEFAULT 1,
-                start_time TEXT NOT NULL,
-                end_time TEXT NOT NULL,
-                append_text TEXT NOT NULL,
-                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
-            );
-            ",
+            "PRAGMA foreign_keys = ON;
+             PRAGMA busy_timeout = 5000;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA cache_size = -4096;",
         )?;
 
-        // Seamless migration for existing database files
-        for table in ["clipboard_history", "phrases"] {
-            for col_def in [
-                "content_type TEXT",
-                "char_count INTEGER",
-                "line_count INTEGER",
-                "byte_count INTEGER",
-                "preview TEXT",
-            ] {
-                let _ = self
-                    .conn
-                    .execute(&format!("ALTER TABLE {} ADD COLUMN {}", table, col_def), []);
-            }
+        if is_file {
+            let _ = self.conn.execute_batch("PRAGMA journal_mode = WAL;");
+            let _ = self.conn.execute_batch("PRAGMA synchronous = NORMAL;");
+            let _ = self.conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;");
         }
 
         Ok(())
     }
 
+    fn table_exists(&self, name: &str) -> bool {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                params![name],
+                |_| Ok(true),
+            )
+            .unwrap_or(false)
+    }
+
+    /// 按 `PRAGMA user_version` 升级到当前 schema。全新库与旧库都从这里进去。
+    fn migrate(&self) -> Result<()> {
+        let version: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or(0);
+
+        if version >= SCHEMA_VERSION {
+            return Ok(());
+        }
+
+        // 无版本号但存在旧表 = 0 号旧库；否则是全新库。
+        let is_legacy = self.table_exists("clipboard_history") || self.table_exists("phrases");
+
+        if is_legacy {
+            self.migrate_from_legacy()?;
+        } else {
+            self.create_current_tables()?;
+        }
+
+        self.conn
+            .pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        Ok(())
+    }
+
+    fn create_current_tables(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS clipboard_history (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                content      TEXT    NOT NULL,
+                content_hash BLOB    NOT NULL,
+                preview      TEXT    NOT NULL DEFAULT '',
+                content_type INTEGER NOT NULL DEFAULT 0,
+                char_count   INTEGER NOT NULL DEFAULT 0,
+                line_count   INTEGER NOT NULL DEFAULT 0,
+                byte_count   INTEGER NOT NULL DEFAULT 0,
+                is_favorite  INTEGER NOT NULL DEFAULT 0,
+                source       INTEGER NOT NULL DEFAULT 0,
+                used_count   INTEGER NOT NULL DEFAULT 1,
+                created_at   INTEGER NOT NULL,
+                last_used_at INTEGER NOT NULL
+            );
+
+            -- 去重索引：只存 16 字节指纹，不再复制整段正文
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_history_hash ON clipboard_history(content_hash);
+
+            -- 列表主序。`id DESC` 是必要的第二键：同一秒内可能有多条，
+            -- 只按时间排序会让分页结果在两次查询之间漂移。
+            CREATE INDEX IF NOT EXISTS ix_history_recent
+                ON clipboard_history(last_used_at DESC, id DESC);
+
+            CREATE TABLE IF NOT EXISTS phrases (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                content      TEXT    NOT NULL,
+                content_hash BLOB    NOT NULL,
+                preview      TEXT    NOT NULL DEFAULT '',
+                content_type INTEGER NOT NULL DEFAULT 0,
+                char_count   INTEGER NOT NULL DEFAULT 0,
+                line_count   INTEGER NOT NULL DEFAULT 0,
+                byte_count   INTEGER NOT NULL DEFAULT 0,
+                sort_order   INTEGER NOT NULL DEFAULT 0,
+                used_count   INTEGER NOT NULL DEFAULT 0,
+                created_at   INTEGER NOT NULL,
+                last_used_at INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_phrases_hash ON phrases(content_hash);
+            CREATE INDEX IF NOT EXISTS ix_phrases_sort ON phrases(sort_order, id);
+
+            CREATE TABLE IF NOT EXISTS secure_config (
+                key        TEXT PRIMARY KEY,
+                value      TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS phrase_rules (
+                id              TEXT PRIMARY KEY,
+                phrase_id       INTEGER NOT NULL,
+                is_enabled      INTEGER NOT NULL DEFAULT 1,
+                insert_position INTEGER NOT NULL DEFAULT 0,
+                position_mode   INTEGER NOT NULL DEFAULT 1,
+                start_time      TEXT NOT NULL,
+                end_time        TEXT NOT NULL,
+                append_text     TEXT NOT NULL DEFAULT '',
+                created_at      INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                FOREIGN KEY(phrase_id) REFERENCES phrases(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS ix_rules_phrase ON phrase_rules(phrase_id);
+
+            CREATE TABLE IF NOT EXISTS phrase_rule_templates (
+                id              TEXT PRIMARY KEY,
+                name            TEXT NOT NULL,
+                insert_position INTEGER NOT NULL DEFAULT 0,
+                position_mode   INTEGER NOT NULL DEFAULT 1,
+                start_time      TEXT NOT NULL,
+                end_time        TEXT NOT NULL,
+                append_text     TEXT NOT NULL DEFAULT '',
+                created_at      INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            );
+            ",
+        )
+    }
+
+    /// 从无版本号的旧库升级。
+    ///
+    /// 迁移范围按需求刻意收窄：**只保留常用语、追加规则、规则模板与配置，剪贴板历史整体丢弃**。
+    /// 旧库里最占空间的就是历史（含全列正文索引），丢弃后新库会立刻缩到几十 KB。
+    /// 常用语的 `id` 原样保留，因此 `phrase_rules.phrase_id` 无需重映射。
+    fn migrate_from_legacy(&self) -> Result<()> {
+        // 结构手术（改名 + 搬迁 + 删旧表）必须在 FK 关闭下做：
+        // `PRAGMA foreign_keys = ON` 时，`DROP TABLE phrases` 会因为子表还有行而报
+        // FOREIGN KEY constraint failed（子表先删又会反着报）。收尾统一做一次
+        // `foreign_key_check` 兜底，中间出错也要把开关恢复回去。
+        let _ = self.conn.execute_batch("PRAGMA foreign_keys = OFF;");
+        let outcome = self.migrate_from_legacy_inner();
+        let _ = self.conn.execute_batch("PRAGMA foreign_keys = ON;");
+        outcome?;
+
+        let violations: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(0);
+        if violations > 0 {
+            crate::log_warn!(
+                "MuClip 数据库迁移后仍有 {} 条外键悬空引用，已保留数据但规则可能失效",
+                violations
+            );
+        }
+        Ok(())
+    }
+
+    fn migrate_from_legacy_inner(&self) -> Result<()> {
+        // 旧索引先删掉：表改名后索引名会保留，与新库同名索引冲突。
+        self.conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_history_last_used;
+             DROP INDEX IF EXISTS idx_history_content;
+             DROP INDEX IF EXISTS idx_phrases_sort;
+             DROP INDEX IF EXISTS idx_phrase_rules_phrase_id;",
+        )?;
+
+        for (old, new) in [
+            ("clipboard_history", "_legacy_history"),
+            ("phrases", "_legacy_phrases"),
+            ("phrase_rules", "_legacy_phrase_rules"),
+            ("phrase_rule_templates", "_legacy_phrase_rule_templates"),
+            ("secure_config", "_legacy_secure_config"),
+        ] {
+            if self.table_exists(old) {
+                self.conn
+                    .execute_batch(&format!("ALTER TABLE {old} RENAME TO {new};"))?;
+            }
+        }
+
+        self.create_current_tables()?;
+
+        // --- 常用语 ---
+        if self.table_exists("_legacy_phrases") {
+            let rows: Vec<LegacyPhraseRow> = {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, content, content_type, char_count, line_count, byte_count, preview, sort_order, created_at, last_used_at
+                     FROM _legacy_phrases ORDER BY sort_order ASC, id ASC",
+                )?;
+                let mapped = stmt.query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2).ok(),
+                        row.get(3).ok(),
+                        row.get(4).ok(),
+                        row.get(5).ok(),
+                        row.get(6).ok(),
+                        row.get(7).unwrap_or(0),
+                        ts_column(row, 8),
+                        ts_column(row, 9),
+                    ))
+                })?;
+                mapped.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+
+            let mut ins = self.conn.prepare(
+                "INSERT INTO phrases (id, content, content_hash, preview, content_type, char_count, line_count, byte_count, sort_order, used_count, created_at, last_used_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11)",
+            )?;
+            for (id, content, ctype, cc, lc, bc, preview, sort_order, created, last_used) in rows {
+                let analysis = analyze_content(&content);
+                let hash = hash_content(&content);
+                ins.execute(params![
+                    id,
+                    content,
+                    hash,
+                    preview.unwrap_or(analysis.preview),
+                    ContentType::from_db_str(ctype.as_deref().unwrap_or("plain_text")).to_db_i64(),
+                    cc.unwrap_or(analysis.char_count as i64),
+                    lc.unwrap_or(analysis.line_count as i64),
+                    bc.unwrap_or(analysis.byte_count as i64),
+                    sort_order,
+                    created,
+                    last_used,
+                ])?;
+            }
+        }
+
+        // --- 追加规则（列结构未变，只把时间戳统一成整数） ---
+        if self.table_exists("_legacy_phrase_rules") {
+            let rows: Vec<LegacyRuleRow> = {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, phrase_id, is_enabled, insert_position, position_mode, start_time, end_time, append_text, created_at
+                     FROM _legacy_phrase_rules",
+                )?;
+                let mapped = stmt.query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        ts_column(row, 8),
+                    ))
+                })?;
+                mapped.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+
+            let mut ins = self.conn.prepare(
+                "INSERT OR REPLACE INTO phrase_rules
+                 (id, phrase_id, is_enabled, insert_position, position_mode, start_time, end_time, append_text, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
+            for (id, phrase_id, enabled, pos, mode, start, end, append, created) in rows {
+                // 只保留还能对应到现存常用语的规则，避免孤儿行破坏外键
+                let phrase_exists: bool = self
+                    .conn
+                    .query_row(
+                        "SELECT 1 FROM phrases WHERE id = ?1",
+                        params![phrase_id],
+                        |_| Ok(true),
+                    )
+                    .unwrap_or(false);
+                if !phrase_exists {
+                    continue;
+                }
+                ins.execute(params![
+                    id, phrase_id, enabled, pos, mode, start, end, append, created
+                ])?;
+            }
+        }
+
+        // --- 规则模板 ---
+        if self.table_exists("_legacy_phrase_rule_templates") {
+            let rows: Vec<LegacyTemplateRow> = {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, name, insert_position, position_mode, start_time, end_time, append_text, created_at
+                     FROM _legacy_phrase_rule_templates",
+                )?;
+                let mapped = stmt.query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        ts_column(row, 7),
+                    ))
+                })?;
+                mapped.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+
+            let mut ins = self.conn.prepare(
+                "INSERT OR REPLACE INTO phrase_rule_templates
+                 (id, name, insert_position, position_mode, start_time, end_time, append_text, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            for (id, name, pos, mode, start, end, append, created) in rows {
+                ins.execute(params![id, name, pos, mode, start, end, append, created])?;
+            }
+        }
+
+        // --- 配置（device_id / auto_discovery 等必须保留：换掉会让已配对设备认不出本机） ---
+        if self.table_exists("_legacy_secure_config") {
+            let rows: Vec<LegacyConfigRow> = {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT key, value, updated_at FROM _legacy_secure_config")?;
+                let mapped =
+                    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, ts_column(row, 2))))?;
+                mapped.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+
+            let mut ins = self.conn.prepare(
+                "INSERT OR REPLACE INTO secure_config (key, value, updated_at) VALUES (?1, ?2, ?3)",
+            )?;
+            for (key, value, updated) in rows {
+                ins.execute(params![key, value, updated])?;
+            }
+        }
+
+        // --- 丢弃旧表（历史按需求整体丢弃） ---
+        // 子表在前、父表在后：即便 FK 开关没关掉，这个顺序也不会撞约束。
+        self.conn.execute_batch(
+            "DROP TABLE IF EXISTS _legacy_phrase_rules;
+             DROP TABLE IF EXISTS _legacy_phrase_rule_templates;
+             DROP TABLE IF EXISTS _legacy_phrases;
+             DROP TABLE IF EXISTS _legacy_history;
+             DROP TABLE IF EXISTS _legacy_secure_config;",
+        )?;
+
+        // 回收旧库留下的空间，并让 auto_vacuum 真正生效
+        let _ = self.conn.execute_batch("VACUUM;");
+
+        crate::log_info!(
+            "MuClip 数据库已升级到 schema v{}：保留常用语/追加规则/模板/配置，剪贴板历史已丢弃",
+            SCHEMA_VERSION
+        );
+        Ok(())
+    }
+
+    /// 历史行的统一列序：
+    /// `id, content, created_at, last_used_at, content_type, char_count, line_count, byte_count, preview`
     fn row_to_history_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryItem> {
         let id: i64 = row.get(0)?;
         let content: String = row.get(1)?;
-        let created_at: String = row.get(2)?;
-        let last_used_at: String = row.get(3)?;
-        let ctype_opt: Option<String> = row.get(4).ok().flatten();
-        let char_opt: Option<i64> = row.get(5).ok().flatten();
-        let line_opt: Option<i64> = row.get(6).ok().flatten();
-        let byte_opt: Option<i64> = row.get(7).ok().flatten();
-        let preview_opt: Option<String> = row.get(8).ok().flatten();
+        // 落盘是整数秒，宿主仍然要字符串，转换只发生在这一个边界上
+        let created_at = fmt_ts(ts_column(row, 2));
+        let last_used_at = fmt_ts(ts_column(row, 3));
+        let content_type = ContentType::from_db_i64(row.get::<_, i64>(4).unwrap_or(0));
+        let char_count = row.get::<_, i64>(5).unwrap_or(0).max(0) as u64;
+        let line_count = row.get::<_, i64>(6).unwrap_or(1).max(1) as u64;
+        let byte_count = row.get::<_, i64>(7).unwrap_or(0).max(0) as u64;
+        let preview: String = row.get(8).unwrap_or_default();
 
-        if let (Some(ct), Some(cc), Some(lc), Some(bc), Some(pv)) =
-            (ctype_opt, char_opt, line_opt, byte_opt, preview_opt)
-        {
-            Ok(HistoryItem {
-                id,
-                content,
-                created_at,
-                last_used_at,
-                content_type: ContentType::from_db_str(&ct),
-                char_count: cc.max(0) as u64,
-                line_count: lc.max(1) as u64,
-                byte_count: bc.max(0) as u64,
-                preview: pv,
-            })
-        } else {
-            Ok(HistoryItem::new(id, content, created_at, last_used_at))
+        // 老数据可能没有分析列（preview 空且字数为 0），就地补算，别让界面显示空白
+        if preview.is_empty() && char_count == 0 {
+            return Ok(HistoryItem::new(id, content, created_at, last_used_at));
         }
+
+        Ok(HistoryItem {
+            id,
+            content,
+            created_at,
+            last_used_at,
+            content_type,
+            char_count,
+            line_count,
+            byte_count,
+            preview,
+        })
     }
 
+    /// 常用语行的统一列序：
+    /// `id, content, created_at, last_used_at, sort_order, content_type, char_count, line_count, byte_count, preview`
     fn row_to_phrase_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<PhraseItem> {
         let id: i64 = row.get(0)?;
         let content: String = row.get(1)?;
-        let created_at: String = row.get(2)?;
-        let last_used_at: String = row.get(3)?;
+        let created_at = fmt_ts(ts_column(row, 2));
+        let last_used_at = fmt_ts(ts_column(row, 3));
         let sort_order: i64 = row.get(4)?;
-        let ctype_opt: Option<String> = row.get(5).ok().flatten();
-        let char_opt: Option<i64> = row.get(6).ok().flatten();
-        let line_opt: Option<i64> = row.get(7).ok().flatten();
-        let byte_opt: Option<i64> = row.get(8).ok().flatten();
-        let preview_opt: Option<String> = row.get(9).ok().flatten();
+        let content_type = ContentType::from_db_i64(row.get::<_, i64>(5).unwrap_or(0));
+        let char_count = row.get::<_, i64>(6).unwrap_or(0).max(0) as u64;
+        let line_count = row.get::<_, i64>(7).unwrap_or(1).max(1) as u64;
+        let byte_count = row.get::<_, i64>(8).unwrap_or(0).max(0) as u64;
+        let preview: String = row.get(9).unwrap_or_default();
 
-        if let (Some(ct), Some(cc), Some(lc), Some(bc), Some(pv)) =
-            (ctype_opt, char_opt, line_opt, byte_opt, preview_opt)
-        {
-            Ok(PhraseItem {
+        if preview.is_empty() && char_count == 0 {
+            return Ok(PhraseItem::new(
                 id,
                 content,
                 created_at,
                 last_used_at,
                 sort_order,
-                content_type: ContentType::from_db_str(&ct),
-                char_count: cc.max(0) as u64,
-                line_count: lc.max(1) as u64,
-                byte_count: bc.max(0) as u64,
-                preview: pv,
-            })
-        } else {
-            Ok(PhraseItem::new(
-                id,
-                content,
-                created_at,
-                last_used_at,
-                sort_order,
-            ))
+            ));
         }
+
+        Ok(PhraseItem {
+            id,
+            content,
+            created_at,
+            last_used_at,
+            sort_order,
+            content_type,
+            char_count,
+            line_count,
+            byte_count,
+            preview,
+        })
     }
 
     fn row_to_phrase_rule(row: &rusqlite::Row<'_>) -> rusqlite::Result<PhraseRule> {
@@ -481,30 +898,30 @@ impl Database {
     /// Upsert a history item: if an identical content already exists, update its `last_used_at` timestamp.
     /// Otherwise, insert as a new record. Returns the record id.
     pub fn upsert_history(&mut self, content: &str, timestamp: Option<&str>) -> Result<i64> {
-        let now = match timestamp {
-            Some(ts) => ts.to_string(),
-            None => Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        };
+        let now = timestamp.map(parse_ts).unwrap_or_else(now_ts);
+        let hash = hash_content(content);
+        let analysis = analyze_content(content);
 
+        // 先去哈希索引里探一次（整数比较），命中后再比对正文兜住哈希碰撞。
+        // 旧实现是 `WHERE content = ?1` 全表逐字符比较，靠的是那个「正文存两遍」的索引。
         let existing_id: Option<i64> = self
             .conn
             .query_row(
-                "SELECT id FROM clipboard_history WHERE content = ?1 LIMIT 1",
-                params![content],
+                "SELECT id FROM clipboard_history WHERE content_hash = ?1 AND content = ?2 LIMIT 1",
+                params![&hash[..], content],
                 |row| row.get(0),
             )
             .ok();
 
-        let analysis = analyze_content(content);
-
         if let Some(id) = existing_id {
             self.conn.execute(
-                "UPDATE clipboard_history 
-                 SET last_used_at = ?1, content_type = ?2, char_count = ?3, line_count = ?4, byte_count = ?5, preview = ?6 
+                "UPDATE clipboard_history
+                 SET last_used_at = ?1, content_type = ?2, char_count = ?3, line_count = ?4,
+                     byte_count = ?5, preview = ?6, used_count = used_count + 1
                  WHERE id = ?7",
                 params![
                     now,
-                    analysis.content_type.as_str(),
+                    analysis.content_type.to_db_i64(),
                     analysis.char_count as i64,
                     analysis.line_count as i64,
                     analysis.byte_count as i64,
@@ -515,17 +932,18 @@ impl Database {
             Ok(id)
         } else {
             self.conn.execute(
-                "INSERT INTO clipboard_history (content, created_at, last_used_at, content_type, char_count, line_count, byte_count, preview) 
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO clipboard_history
+                 (content, content_hash, preview, content_type, char_count, line_count, byte_count, created_at, last_used_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
                 params![
                     content,
-                    now,
-                    now,
-                    analysis.content_type.as_str(),
+                    &hash[..],
+                    analysis.preview,
+                    analysis.content_type.to_db_i64(),
                     analysis.char_count as i64,
                     analysis.line_count as i64,
                     analysis.byte_count as i64,
-                    analysis.preview
+                    now
                 ],
             )?;
             Ok(self.conn.last_insert_rowid())
@@ -537,28 +955,34 @@ impl Database {
     pub fn batch_upsert_history(&mut self, items: &[(String, String, String)]) -> Result<()> {
         let tx = self.conn.transaction()?;
         {
-            let mut select_stmt =
-                tx.prepare("SELECT id FROM clipboard_history WHERE content = ?1 LIMIT 1")?;
+            let mut select_stmt = tx.prepare(
+                "SELECT id FROM clipboard_history WHERE content_hash = ?1 AND content = ?2 LIMIT 1",
+            )?;
             let mut update_stmt = tx.prepare(
-                "UPDATE clipboard_history 
-                 SET last_used_at = ?1, content_type = ?2, char_count = ?3, line_count = ?4, byte_count = ?5, preview = ?6 
+                "UPDATE clipboard_history
+                 SET last_used_at = ?1, content_type = ?2, char_count = ?3, line_count = ?4,
+                     byte_count = ?5, preview = ?6, used_count = used_count + 1
                  WHERE id = ?7",
             )?;
             let mut insert_stmt = tx.prepare(
-                "INSERT INTO clipboard_history (content, created_at, last_used_at, content_type, char_count, line_count, byte_count, preview) 
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO clipboard_history
+                 (content, content_hash, preview, content_type, char_count, line_count, byte_count, created_at, last_used_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
 
             for (content, created_at, last_used_at) in items {
+                let created = parse_ts(created_at);
+                let last_used = parse_ts(last_used_at);
+                let hash = hash_content(content);
                 let existing_id: Option<i64> = select_stmt
-                    .query_row(params![content], |row| row.get(0))
+                    .query_row(params![&hash[..], content], |row| row.get(0))
                     .ok();
                 let analysis = analyze_content(content);
 
                 if let Some(id) = existing_id {
                     update_stmt.execute(params![
-                        last_used_at,
-                        analysis.content_type.as_str(),
+                        last_used,
+                        analysis.content_type.to_db_i64(),
                         analysis.char_count as i64,
                         analysis.line_count as i64,
                         analysis.byte_count as i64,
@@ -568,13 +992,14 @@ impl Database {
                 } else {
                     insert_stmt.execute(params![
                         content,
-                        created_at,
-                        last_used_at,
-                        analysis.content_type.as_str(),
+                        &hash[..],
+                        analysis.preview,
+                        analysis.content_type.to_db_i64(),
                         analysis.char_count as i64,
                         analysis.line_count as i64,
                         analysis.byte_count as i64,
-                        analysis.preview
+                        created,
+                        last_used
                     ])?;
                 }
             }
@@ -620,23 +1045,80 @@ impl Database {
     }
 
     /// Search history items matching the query text.
+    ///
+    /// 保留旧签名给 Android / uniffi 用，内部转调结构化查询（`types` 不限）。
     pub fn search_history(&self, query: &str, limit: usize) -> Result<Vec<HistoryItem>> {
-        let like_query = format!("%{}%", query);
-        let mut stmt = self.conn.prepare(
-            "SELECT id, content, created_at, last_used_at, content_type, char_count, line_count, byte_count, preview 
-             FROM clipboard_history 
-             WHERE content LIKE ?1 
-             ORDER BY last_used_at DESC 
-             LIMIT ?2",
-        )?;
+        self.search_history_page(&HistorySearch {
+            query: query.to_string(),
+            types: Vec::new(),
+            offset: 0,
+            limit,
+        })
+    }
 
-        let rows = stmt.query_map(params![like_query, limit as i64], Self::row_to_history_item)?;
+    /// 组装搜索的 WHERE 子句与参数。
+    ///
+    /// 返回的 SQL 片段以 `WHERE ` 开头；无任何条件时返回空串。
+    fn search_history_filter(req: &HistorySearch) -> (String, Vec<rusqlite::types::Value>) {
+        let mut clauses: Vec<String> = Vec::new();
+        let mut args: Vec<rusqlite::types::Value> = Vec::new();
+
+        let trimmed = req.query.trim();
+        if !trimmed.is_empty() {
+            clauses.push(format!("content LIKE ? {LIKE_ESCAPE}"));
+            args.push(rusqlite::types::Value::Text(like_pattern(trimmed)));
+        }
+        if !req.types.is_empty() {
+            let placeholders = vec!["?"; req.types.len()].join(",");
+            clauses.push(format!("content_type IN ({placeholders})"));
+            for t in &req.types {
+                args.push(rusqlite::types::Value::Integer(*t));
+            }
+        }
+
+        if clauses.is_empty() {
+            (String::new(), args)
+        } else {
+            (format!("WHERE {}", clauses.join(" AND ")), args)
+        }
+    }
+
+    /// 分页搜索历史。`order by last_used_at DESC` 走 `ix_history_recent`：
+    /// 高频词能靠索引顺序提前凑满 limit 停下来，不必扫完整张表。
+    pub fn search_history_page(&self, req: &HistorySearch) -> Result<Vec<HistoryItem>> {
+        let (where_sql, mut args) = Self::search_history_filter(req);
+        let limit = if req.limit == 0 {
+            DEFAULT_SEARCH_LIMIT
+        } else {
+            req.limit.min(SEARCH_MAX_LIMIT)
+        };
+        args.push(rusqlite::types::Value::Integer(limit as i64));
+        args.push(rusqlite::types::Value::Integer(req.offset as i64));
+
+        let sql = format!(
+            "SELECT id, content, created_at, last_used_at, content_type, char_count, line_count, byte_count, preview
+             FROM clipboard_history {where_sql}
+             ORDER BY last_used_at DESC, id DESC
+             LIMIT ? OFFSET ?"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args), Self::row_to_history_item)?;
 
         let mut items = Vec::new();
         for item in rows {
             items.push(item?);
         }
         Ok(items)
+    }
+
+    /// 命中的总条数（不受 limit 影响），用于「共 N 条」与「还有更多」判断。
+    pub fn search_history_count(&self, req: &HistorySearch) -> Result<usize> {
+        let (where_sql, args) = Self::search_history_filter(req);
+        let sql = format!("SELECT COUNT(*) FROM clipboard_history {where_sql}");
+        let count: i64 = self
+            .conn
+            .query_row(&sql, rusqlite::params_from_iter(args), |row| row.get(0))?;
+        Ok(count.max(0) as usize)
     }
 
     /// Delete a single history item by id.
@@ -653,11 +1135,15 @@ impl Database {
     }
 
     /// Delete history items older than the specified retention days.
+    ///
+    /// 收藏项（`is_favorite = 1`）不参与过期清理：用户手动钉住的内容不该被定时器删掉。
     pub fn cleanup_expired_history(&mut self, days: u32) -> Result<usize> {
-        let modifier = format!("-{} days", days);
+        // 整数秒直接比大小，范围走 ix_history_recent；旧实现是 `datetime(last_used_at) < ...`，
+        // 每行都要解析一次字符串，任何索引都用不上。
+        let cutoff = now_ts() - days as i64 * 86_400;
         let deleted = self.conn.execute(
-            "DELETE FROM clipboard_history WHERE datetime(last_used_at) < datetime('now', 'localtime', ?1)",
-            params![modifier],
+            "DELETE FROM clipboard_history WHERE last_used_at < ?1 AND is_favorite = 0",
+            params![cutoff],
         )?;
         Ok(deleted)
     }
@@ -665,8 +1151,25 @@ impl Database {
     // --- Phrase operations ---
 
     /// Add a new phrase. Automatically assigns sort_order at the end.
+    ///
+    /// 内容完全相同（哈希一致且正文一致）的常用语不重复插入，直接返回既有 id——
+    /// `ux_phrases_hash` 是唯一索引，重复插入会直接报约束错误，这里把它变成幂等。
     pub fn add_phrase(&mut self, content: &str) -> Result<i64> {
-        let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let now = now_ts();
+        let hash = hash_content(content);
+
+        let existing: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM phrases WHERE content_hash = ?1 AND content = ?2 LIMIT 1",
+                params![&hash[..], content],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(id) = existing {
+            return Ok(id);
+        }
+
         let max_sort: Option<i64> = self
             .conn
             .query_row("SELECT MAX(sort_order) FROM phrases", [], |row| row.get(0))
@@ -675,37 +1178,44 @@ impl Database {
         let analysis = analyze_content(content);
 
         self.conn.execute(
-            "INSERT INTO phrases (content, created_at, last_used_at, sort_order, content_type, char_count, line_count, byte_count, preview) 
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO phrases
+             (content, content_hash, preview, content_type, char_count, line_count, byte_count, sort_order, created_at, last_used_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
             params![
                 content,
-                now,
-                now,
-                next_sort,
-                analysis.content_type.as_str(),
+                &hash[..],
+                analysis.preview,
+                analysis.content_type.to_db_i64(),
                 analysis.char_count as i64,
                 analysis.line_count as i64,
                 analysis.byte_count as i64,
-                analysis.preview
+                next_sort,
+                now
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
 
     /// Edit the content of an existing phrase.
+    ///
+    /// 正文变了，`content_hash` 必须一起更新——否则去重索引会指向旧指纹，
+    /// 后续 upsert 认不出这条记录，还会在唯一索引上撞车。
     pub fn edit_phrase(&mut self, id: i64, new_content: &str) -> Result<()> {
         let analysis = analyze_content(new_content);
+        let hash = hash_content(new_content);
         self.conn.execute(
-            "UPDATE phrases 
-             SET content = ?1, content_type = ?2, char_count = ?3, line_count = ?4, byte_count = ?5, preview = ?6 
-             WHERE id = ?7",
+            "UPDATE phrases
+             SET content = ?1, content_hash = ?2, preview = ?3, content_type = ?4,
+                 char_count = ?5, line_count = ?6, byte_count = ?7
+             WHERE id = ?8",
             params![
                 new_content,
-                analysis.content_type.as_str(),
+                &hash[..],
+                analysis.preview,
+                analysis.content_type.to_db_i64(),
                 analysis.char_count as i64,
                 analysis.line_count as i64,
                 analysis.byte_count as i64,
-                analysis.preview,
                 id
             ],
         )?;
@@ -727,10 +1237,9 @@ impl Database {
 
     /// Mark a phrase as used, updating its `last_used_at` timestamp.
     pub fn update_phrase_used(&mut self, id: i64) -> Result<()> {
-        let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         self.conn.execute(
-            "UPDATE phrases SET last_used_at = ?1 WHERE id = ?2",
-            params![now, id],
+            "UPDATE phrases SET last_used_at = ?1, used_count = used_count + 1 WHERE id = ?2",
+            params![now_ts(), id],
         )?;
         Ok(())
     }
@@ -754,15 +1263,17 @@ impl Database {
 
     /// Search phrases matching the query text.
     pub fn search_phrases(&self, query: &str) -> Result<Vec<PhraseItem>> {
-        let like_query = format!("%{}%", query);
-        let mut stmt = self.conn.prepare(
-            "SELECT id, content, created_at, last_used_at, sort_order, content_type, char_count, line_count, byte_count, preview 
-             FROM phrases 
-             WHERE content LIKE ?1 
-             ORDER BY sort_order ASC, last_used_at DESC",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, content, created_at, last_used_at, sort_order, content_type, char_count, line_count, byte_count, preview
+             FROM phrases
+             WHERE content LIKE ? {LIKE_ESCAPE}
+             ORDER BY sort_order ASC, last_used_at DESC"
+        ))?;
 
-        let rows = stmt.query_map(params![like_query], Self::row_to_phrase_item)?;
+        let rows = stmt.query_map(
+            params![like_pattern(query.trim())],
+            Self::row_to_phrase_item,
+        )?;
 
         let mut items = Vec::new();
         for item in rows {
@@ -788,11 +1299,10 @@ impl Database {
 
     /// Sets a persistent configuration key-value pair in SQLite.
     pub fn set_config(&mut self, key: &str, value: &str) -> Result<()> {
-        let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         self.conn.execute(
             "INSERT INTO secure_config (key, value, updated_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            params![key, value, now],
+            params![key, value, now_ts()],
         )?;
         Ok(())
     }
@@ -1125,32 +1635,37 @@ impl Database {
         // Import clipboard history
         {
             let mut select_hist = tx.prepare(
-                "SELECT id, last_used_at FROM clipboard_history WHERE content = ?1 LIMIT 1",
+                "SELECT id, last_used_at FROM clipboard_history WHERE content_hash = ?1 AND content = ?2 LIMIT 1",
             )?;
             let mut update_hist = tx.prepare(
-                "UPDATE clipboard_history 
-                 SET last_used_at = ?1, content_type = ?2, char_count = ?3, line_count = ?4, byte_count = ?5, preview = ?6 
+                "UPDATE clipboard_history
+                 SET last_used_at = ?1, content_type = ?2, char_count = ?3, line_count = ?4,
+                     byte_count = ?5, preview = ?6
                  WHERE id = ?7",
             )?;
             let mut insert_hist = tx.prepare(
-                "INSERT INTO clipboard_history (content, created_at, last_used_at, content_type, char_count, line_count, byte_count, preview)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO clipboard_history
+                 (content, content_hash, preview, content_type, char_count, line_count, byte_count, created_at, last_used_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
 
             for item in &backup.history {
-                let existing: Option<(i64, String)> = select_hist
-                    .query_row(params![item.content], |row| Ok((row.get(0)?, row.get(1)?)))
+                let hash = hash_content(&item.content);
+                let item_created = parse_ts(&item.created_at);
+                let item_last_used = parse_ts(&item.last_used_at);
+
+                let existing: Option<(i64, i64)> = select_hist
+                    .query_row(params![&hash[..], item.content], |row| {
+                        Ok((row.get(0)?, ts_column(row, 1)))
+                    })
                     .ok();
 
                 if let Some((id, existing_last_used)) = existing {
-                    let newer_last_used = if item.last_used_at > existing_last_used {
-                        &item.last_used_at
-                    } else {
-                        &existing_last_used
-                    };
+                    // 合并时保留较新的使用时间，别让导入把「最近使用」冲回旧值
+                    let newer_last_used = item_last_used.max(existing_last_used);
                     update_hist.execute(params![
                         newer_last_used,
-                        item.content_type.as_str(),
+                        item.content_type.to_db_i64(),
                         item.char_count as i64,
                         item.line_count as i64,
                         item.byte_count as i64,
@@ -1160,13 +1675,14 @@ impl Database {
                 } else {
                     insert_hist.execute(params![
                         item.content,
-                        item.created_at,
-                        item.last_used_at,
-                        item.content_type.as_str(),
+                        &hash[..],
+                        item.preview,
+                        item.content_type.to_db_i64(),
                         item.char_count as i64,
                         item.line_count as i64,
                         item.byte_count as i64,
-                        item.preview,
+                        item_created,
+                        item_last_used,
                     ])?;
                 }
             }
@@ -1174,28 +1690,33 @@ impl Database {
 
         // Import phrases
         for p in &backup.phrases {
+            let hash = hash_content(&p.content);
+            let created = parse_ts(&p.created_at);
+            let last_used = parse_ts(&p.last_used_at);
             if replace_all {
                 tx.execute(
-                    "INSERT INTO phrases (id, content, created_at, last_used_at, sort_order, content_type, char_count, line_count, byte_count, preview)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    "INSERT INTO phrases
+                     (id, content, content_hash, preview, content_type, char_count, line_count, byte_count, sort_order, created_at, last_used_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                     params![
                         p.id,
                         p.content,
-                        p.created_at,
-                        p.last_used_at,
-                        p.sort_order,
-                        p.content_type.as_str(),
+                        &hash[..],
+                        p.preview,
+                        p.content_type.to_db_i64(),
                         p.char_count as i64,
                         p.line_count as i64,
                         p.byte_count as i64,
-                        p.preview,
+                        p.sort_order,
+                        created,
+                        last_used,
                     ],
                 )?;
             } else {
                 let exists: bool = tx
                     .query_row(
-                        "SELECT 1 FROM phrases WHERE content = ?1 LIMIT 1",
-                        params![p.content],
+                        "SELECT 1 FROM phrases WHERE content_hash = ?1 AND content = ?2 LIMIT 1",
+                        params![&hash[..], p.content],
                         |_| Ok(true),
                     )
                     .unwrap_or(false);
@@ -1210,18 +1731,20 @@ impl Database {
                         .unwrap_or(1);
 
                     tx.execute(
-                        "INSERT INTO phrases (content, created_at, last_used_at, sort_order, content_type, char_count, line_count, byte_count, preview)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        "INSERT INTO phrases
+                         (content, content_hash, preview, content_type, char_count, line_count, byte_count, sort_order, created_at, last_used_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                         params![
                             p.content,
-                            p.created_at,
-                            p.last_used_at,
-                            next_sort,
-                            p.content_type.as_str(),
+                            &hash[..],
+                            p.preview,
+                            p.content_type.to_db_i64(),
                             p.char_count as i64,
                             p.line_count as i64,
                             p.byte_count as i64,
-                            p.preview,
+                            next_sort,
+                            created,
+                            last_used,
                         ],
                     )?;
                 }
@@ -1289,7 +1812,7 @@ impl Database {
                      ON CONFLICT(key) DO UPDATE SET
                         value = excluded.value,
                         updated_at = excluded.updated_at",
-                    params![k, v, chrono::Utc::now().to_rfc3339()],
+                    params![k, v, now_ts()],
                 )?;
             }
         }
@@ -1447,6 +1970,120 @@ mod tests {
         let items_after = db.query_history(10).unwrap();
         assert_eq!(items_after.len(), 1);
         assert_eq!(items_after[0].content, "World");
+    }
+
+    /// 搜索按字面量匹配：`%` / `_` / `\` 是 LIKE 元字符，不转义会退化成通配符。
+    /// 回归的是「搜 `%` 命中全库」这个真实错误行为。
+    #[test]
+    fn search_treats_like_wildcards_as_literals() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.upsert_history("折扣 50% 起", None).unwrap();
+        db.upsert_history("命名 a_b 下划线", None).unwrap();
+        db.upsert_history(r"路径 C:\temp\file.txt", None).unwrap();
+        db.upsert_history("普通文本没有任何特殊符号", None).unwrap();
+        assert_eq!(db.count_history().unwrap(), 4);
+
+        let hit = db.search_history("%", 50).unwrap();
+        assert_eq!(hit.len(), 1, "搜 % 只能命中真正含 % 的那条");
+        assert_eq!(hit[0].content, "折扣 50% 起");
+
+        let hit = db.search_history("_", 50).unwrap();
+        assert_eq!(hit.len(), 1, "搜 _ 不能退化成「任意单字符」");
+        assert_eq!(hit[0].content, "命名 a_b 下划线");
+
+        let hit = db.search_history("\\", 50).unwrap();
+        assert_eq!(
+            hit.len(),
+            1,
+            "反斜杠应当作字面量，且不能触发 ESCAPE 解析错误"
+        );
+        assert!(hit[0].content.contains("temp"));
+
+        // 正常关键词不受影响
+        let hit = db.search_history("下划线", 50).unwrap();
+        assert_eq!(hit.len(), 1);
+    }
+
+    /// 类型筛选必须下推到 SQL：否则「先取 500 条再内存过滤」会让结果残缺。
+    #[test]
+    fn search_filters_by_type_without_losing_matching_rows() {
+        let mut db = Database::open_in_memory().unwrap();
+        for i in 0..30 {
+            db.upsert_history(&format!("普通文本 {i}"), None).unwrap();
+        }
+        db.upsert_history("https://example.com/alpha", None)
+            .unwrap();
+        db.upsert_history("https://example.com/beta", None).unwrap();
+
+        // 30 条文本排在前面，URL 只有 2 条；若靠内存过滤，limit=10 时一条都拿不到
+        let urls = db
+            .search_history_page(&HistorySearch {
+                query: String::new(),
+                types: vec![ContentType::Url.to_db_i64()],
+                offset: 0,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(urls.len(), 2);
+        assert!(urls.iter().all(|i| i.content_type == ContentType::Url));
+
+        let url_count = db
+            .search_history_count(&HistorySearch {
+                query: String::new(),
+                types: vec![ContentType::Url.to_db_i64()],
+                offset: 0,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(url_count, 2);
+    }
+
+    /// 分页：总数准、两页不重叠、越界返回空。
+    #[test]
+    fn search_pagination_is_stable_and_count_matches() {
+        let mut db = Database::open_in_memory().unwrap();
+        for i in 0..32 {
+            db.upsert_history(&format!("条目 {i}"), None).unwrap();
+        }
+
+        let base = HistorySearch {
+            query: String::new(),
+            types: Vec::new(),
+            offset: 0,
+            limit: 10,
+        };
+        assert_eq!(db.search_history_count(&base).unwrap(), 32);
+
+        let p1 = db.search_history_page(&base).unwrap();
+        assert_eq!(p1.len(), 10);
+
+        let p2 = db
+            .search_history_page(&HistorySearch {
+                offset: 10,
+                ..base.clone()
+            })
+            .unwrap();
+        assert_eq!(p2.len(), 10);
+
+        // 同一秒内插入的 32 条靠 id DESC 兜底排序，两页不能有交集也不能漏
+        let ids: std::collections::HashSet<i64> =
+            p1.iter().chain(p2.iter()).map(|i| i.id).collect();
+        assert_eq!(ids.len(), 20, "分页不能重复也不能丢行");
+
+        let empty = db
+            .search_history_page(&HistorySearch {
+                offset: 1000,
+                ..base.clone()
+            })
+            .unwrap();
+        assert!(empty.is_empty());
+
+        // 关键词 + 类型的组合筛选
+        let with_query = HistorySearch {
+            query: "条目 1".to_string(),
+            ..base.clone()
+        };
+        assert_eq!(db.search_history_count(&with_query).unwrap(), 11);
     }
 
     #[test]
@@ -1845,5 +2482,240 @@ mod tests {
         let head = std::fs::read(&p).unwrap();
         assert_eq!(&head[..16], b"SQLite format 3\0");
         assert!(!p.with_file_name("muclip.db.plaintext.bak").exists());
+    }
+
+    /// 造一个 schema v0 的旧库：TEXT 时间戳、字符串内容类型、全列正文索引、无 `user_version`。
+    ///
+    /// 关闭外键是为了能造出「孤儿规则」（旧版本可能已经留下这种行），
+    /// 迁移逻辑必须能跳过它而不是崩掉。
+    fn create_legacy_db(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE clipboard_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_used_at TEXT NOT NULL,
+                content_type TEXT,
+                char_count INTEGER,
+                line_count INTEGER,
+                byte_count INTEGER,
+                preview TEXT
+            );
+            CREATE INDEX idx_history_last_used ON clipboard_history(last_used_at DESC);
+            CREATE INDEX idx_history_content ON clipboard_history(content);
+
+            CREATE TABLE phrases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_used_at TEXT NOT NULL,
+                sort_order INTEGER DEFAULT 0,
+                content_type TEXT,
+                char_count INTEGER,
+                line_count INTEGER,
+                byte_count INTEGER,
+                preview TEXT
+            );
+            CREATE INDEX idx_phrases_sort ON phrases(sort_order ASC, last_used_at DESC);
+
+            CREATE TABLE secure_config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE phrase_rules (
+                id TEXT PRIMARY KEY,
+                phrase_id INTEGER NOT NULL,
+                is_enabled INTEGER NOT NULL DEFAULT 1,
+                insert_position INTEGER NOT NULL DEFAULT 0,
+                position_mode INTEGER NOT NULL DEFAULT 1,
+                start_time TEXT NOT NULL,
+                end_time TEXT NOT NULL,
+                append_text TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                FOREIGN KEY(phrase_id) REFERENCES phrases(id) ON DELETE CASCADE
+            );
+            CREATE INDEX idx_phrase_rules_phrase_id ON phrase_rules(phrase_id);
+
+            CREATE TABLE phrase_rule_templates (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                insert_position INTEGER NOT NULL DEFAULT 0,
+                position_mode INTEGER NOT NULL DEFAULT 1,
+                start_time TEXT NOT NULL,
+                end_time TEXT NOT NULL,
+                append_text TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            );
+
+            -- 历史：迁移后应当整体消失
+            INSERT INTO clipboard_history
+                (content, created_at, last_used_at, content_type, char_count, line_count, byte_count, preview)
+            VALUES
+                ('一段旧历史', '2026-01-01 09:00:00', '2026-01-05 09:00:00', 'plain_text', 5, 1, 15, '一段旧历史'),
+                ('https://old.example', '2026-01-02 09:00:00', '2026-01-06 09:00:00', 'url', 20, 1, 20, 'https://old.example');
+
+            -- 常用语：必须全部保留，id 也要保持原值（规则靠它关联）
+            INSERT INTO phrases
+                (id, content, created_at, last_used_at, sort_order, content_type, char_count, line_count, byte_count, preview)
+            VALUES
+                (7, 'https://example.com', '2026-01-02 10:00:00', '2026-01-03 11:00:00', 3, 'url', 19, 1, 19, 'https://example.com'),
+                (9, '感谢您的咨询', '2026-01-04 10:00:00', '2026-01-04 10:00:00', 4, 'plain_text', 6, 1, 18, '感谢您的咨询');
+
+            INSERT INTO phrase_rules
+                (id, phrase_id, is_enabled, insert_position, position_mode, start_time, end_time, append_text, created_at)
+            VALUES
+                ('rule-ok', 7, 1, 2, 1, '09:00', '18:00', '（已处理）', 1767225600),
+                ('rule-orphan', 404, 1, 0, 1, '00:00', '23:59', '', 1767225600);
+
+            INSERT INTO phrase_rule_templates
+                (id, name, insert_position, position_mode, start_time, end_time, append_text, created_at)
+            VALUES ('tpl-1', '下班时间', 0, 2, '18:00', '23:59', '明天回复您', 1767225600);
+
+            INSERT INTO secure_config (key, value, updated_at) VALUES
+                ('device_id', 'device-保持-不变', '2026-01-01 09:00:00'),
+                ('clipboard_max_items', '500', '2026-01-01 09:00:00');
+            ",
+        )
+        .unwrap();
+    }
+
+    /// 旧库升级：常用语 / 规则 / 模板 / 配置完整保留，历史整体丢弃，`user_version` 打到 2。
+    #[test]
+    fn legacy_schema_migrates_keeping_phrases_and_dropping_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        create_legacy_db(&path);
+
+        let mut db = Database::open(&path).unwrap();
+
+        // 历史被丢弃
+        assert_eq!(db.count_history().unwrap(), 0);
+        assert!(!db.table_exists("_legacy_history"));
+        assert!(!db.table_exists("_legacy_phrases"));
+
+        // 常用语原样保留（含 id、排序、内容类型、统计列）
+        let all = db.query_phrases().unwrap();
+        assert_eq!(all.len(), 2);
+        // sort_order ASC：3 在 4 前，说明排序字段也搬过来了
+        assert_eq!(all[0].id, 7);
+        assert_eq!(all[1].id, 9);
+
+        let url = all
+            .iter()
+            .find(|p| p.content == "https://example.com")
+            .unwrap();
+        assert_eq!(url.id, 7);
+        assert_eq!(url.sort_order, 3);
+        assert_eq!(url.content_type, ContentType::Url);
+        assert_eq!(url.char_count, 19);
+        assert_eq!(url.created_at, "2026-01-02 10:00:00");
+        assert_eq!(url.last_used_at, "2026-01-03 11:00:00");
+
+        let cn = all.iter().find(|p| p.content == "感谢您的咨询").unwrap();
+        assert_eq!(cn.id, 9);
+        assert_eq!(cn.preview, "感谢您的咨询");
+
+        // 规则：孤儿行（phrase_id 指向不存在的常用语）被丢弃
+        let rules = db.query_all_phrase_rules().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].id, "rule-ok");
+        assert_eq!(rules[0].phrase_id, 7);
+        assert_eq!(rules[0].append_text, "（已处理）");
+
+        let templates = db.query_phrase_rule_templates().unwrap();
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].name, "下班时间");
+
+        // 配置：device_id 必须保留，换掉会让已配对设备认不出本机
+        assert_eq!(
+            db.get_config("device_id").unwrap(),
+            Some("device-保持-不变".to_string())
+        );
+        assert_eq!(
+            db.get_config("clipboard_max_items").unwrap(),
+            Some("500".to_string())
+        );
+
+        // 版本号已经打上
+        let version: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // 迁移后的库可正常写入，且重复内容按哈希去重
+        let new_id = db.add_phrase("新的常用语").unwrap();
+        assert_eq!(db.add_phrase("新的常用语").unwrap(), new_id);
+        db.upsert_history("迁移后写入", None).unwrap();
+        assert_eq!(db.count_history().unwrap(), 1);
+    }
+
+    /// 迁移是幂等的：同一个库连续打开两次不会重跑搬运，也不会丢数据。
+    #[test]
+    fn migration_is_idempotent_across_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        create_legacy_db(&path);
+
+        {
+            let db = Database::open(&path).unwrap();
+            assert_eq!(db.query_phrases().unwrap().len(), 2);
+        }
+
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.query_phrases().unwrap().len(), 2);
+        assert_eq!(db.query_all_phrase_rules().unwrap().len(), 1);
+        assert_eq!(
+            db.get_config("device_id").unwrap(),
+            Some("device-保持-不变".to_string())
+        );
+    }
+
+    /// 新库不会把自己误判成旧库（写入 `user_version` 后第二次打开直接短路）。
+    #[test]
+    fn fresh_database_reports_current_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh.db");
+        {
+            let db = Database::open(&path).unwrap();
+            let version: i64 = db
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, SCHEMA_VERSION);
+            // 全新库不该出现任何 _legacy_* 表
+            assert!(!db.table_exists("_legacy_phrases"));
+        }
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.count_history().unwrap(), 0);
+    }
+
+    /// 索引体积的关键约束：正文只存一份。`dbstat` 能按对象拆账，
+    /// 一旦有人把手写回 `CREATE INDEX ... (content)`，这条会立刻失败。
+    #[test]
+    fn content_is_not_duplicated_into_an_index() {
+        let db = Database::open_in_memory().unwrap();
+        let mut stmt = db
+            .conn
+            .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL")
+            .unwrap();
+        let indexes: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(!indexes.is_empty());
+        for (name, sql) in indexes {
+            let lowered = sql.to_lowercase();
+            assert!(
+                !lowered.contains("(content)"),
+                "索引 {name} 把正文整列存了一遍，库体积会翻倍：{sql}"
+            );
+        }
     }
 }

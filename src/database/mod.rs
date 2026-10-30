@@ -1,3 +1,6 @@
 pub mod sqlite;
 
-pub use sqlite::{Database, HistoryItem, PhraseItem, PhraseRule, PhraseRuleTemplate};
+pub use sqlite::{
+    Database, HistoryItem, HistorySearch, PhraseItem, PhraseRule, PhraseRuleTemplate,
+    content_fingerprint,
+};
