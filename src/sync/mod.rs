@@ -301,18 +301,24 @@ impl MuClipSyncEngine {
             }
         }
 
+        // ⚠️ 必须在 `remove_paired_device_id` 之前取密钥：那一步会连带删掉
+        // `peer_keys[dev_id]`，之后再 `get_peer_key` 必然拿到 None，于是退回
+        // 交给 `get_long_term_key()`（本机随机长期密钥）。而通告的 PFS 握手只认
+        // 两两配对密钥，用错密钥的对端认证必然失败 → 通告发不出去 → 对端不会自动解配。
+        // 这个顺序问题让「双方在线自动解配」长期静默失效（有测试覆盖）。
+        let notice_key = self
+            .peer_manager
+            .get_peer_key(dev_id)
+            .or_else(|| self.get_long_term_key());
+
         self.discovery.remove_paired_device_id(dev_id);
 
         for addr in &target_addrs {
             self.client.close_connection(addr);
         }
 
-        let peer_key_opt = self
-            .peer_manager
-            .get_peer_key(dev_id)
-            .or_else(|| self.get_long_term_key());
         if !target_addrs.is_empty() {
-            if let Some(peer_key) = peer_key_opt {
+            if let Some(peer_key) = notice_key {
                 let client_ref = Arc::clone(&self.client);
                 let local_id = self.config.device_id.clone();
                 let dev_id_owned = dev_id.to_string();
@@ -321,16 +327,36 @@ impl MuClipSyncEngine {
                         // Best-effort: the peer only drops its side of the pairing after it has
                         // authenticated this notice, so a rejected/failed send leaves a stale
                         // record on the remote end. Retry once to absorb startup/connect races.
-                        if client_ref
-                            .send_unpair_notice(&addr, &local_id, Some(&dev_id_owned), &peer_key)
-                            .is_err()
-                        {
-                            let _ = client_ref.send_unpair_notice(
+                        let mut last_err = match client_ref.send_unpair_notice(
+                            &addr,
+                            &local_id,
+                            Some(&dev_id_owned),
+                            &peer_key,
+                        ) {
+                            Ok(()) => None,
+                            Err(e) => Some(e),
+                        };
+                        if last_err.is_some() {
+                            last_err = match client_ref.send_unpair_notice(
                                 &addr,
                                 &local_id,
                                 Some(&dev_id_owned),
                                 &peer_key,
+                            ) {
+                                Ok(()) => None,
+                                Err(e) => Some(e),
+                            };
+                        }
+                        // 静默失败是这套逻辑最坑的地方：本端已经解配、UI 显示成功，
+                        // 对端却毫无变化，用户只能靠「同步一直失败」反推。
+                        if let Some(e) = last_err {
+                            crate::log_warn!(
+                                "解配通告未能送达 {}（对端可能离线）：{}；对端将在下次同步收到 ERR_NOT_PAIRED 时自行清理",
+                                addr,
+                                e
                             );
+                        } else {
+                            crate::log_info!("解配通告已送达 {}", addr);
                         }
                     }
                 });
@@ -502,17 +528,37 @@ impl MuClipSyncEngine {
 
                     if !delivered {
                         if let Some(e) = last_err {
-                            if !matches!(e, TransportError::NotPairedByPeer) {
-                                if let Some((h, p)) =
+                            if matches!(e, TransportError::NotPairedByPeer) {
+                                // 对端回 ERR_NOT_PAIRED：它已经把我们解掉了，而我们离线时
+                                // 错过了 MSG_UNPAIR_NOTICE。这里必须跟着本地清理并回调宿主，
+                                // 否则设备列表里会留一条「每条剪贴板都同步失败」的死记录，
+                                // 用户还得手动删一次。
+                                //
+                                // 走 `notify_peer_unpaired`（只删本地 + 回调）而不是
+                                // `remove_paired_device`（会再发一次通告）——对端早就解了，
+                                // 反向再发通告只会在两端之间来回弹成回声。
+                                let peer_dev = dev_id_opt.clone().or_else(|| {
                                     discovery::parse_peer_endpoint(&addr, DEFAULT_SYNC_PORT)
-                                {
-                                    peer_mgr_ref.mark_peer_offline_if_stale(
-                                        dev_id_opt.as_deref().unwrap_or(""),
-                                        &h,
-                                        p,
-                                        discovery::PEER_TIMEOUT_SECS * 1000,
+                                        .and_then(|(h, p)| {
+                                            peer_mgr_ref.find_device_id_by_endpoint(&h, p)
+                                        })
+                                });
+                                if let Some(peer_dev) = peer_dev {
+                                    crate::log_info!(
+                                        "对端 {} 已单方面解配（ERR_NOT_PAIRED），本地同步清除配对与密钥",
+                                        peer_dev
                                     );
+                                    self.server.notify_peer_unpaired(&peer_dev);
                                 }
+                            } else if let Some((h, p)) =
+                                discovery::parse_peer_endpoint(&addr, DEFAULT_SYNC_PORT)
+                            {
+                                peer_mgr_ref.mark_peer_offline_if_stale(
+                                    dev_id_opt.as_deref().unwrap_or(""),
+                                    &h,
+                                    p,
+                                    discovery::PEER_TIMEOUT_SECS * 1000,
+                                );
                             }
                         }
                     }
@@ -1064,5 +1110,191 @@ mod tests {
         node_a.stop();
         node_b.stop();
         node_c.stop();
+    }
+
+    /// 双方同时在线时，一方解配必须把另一方也解开。
+    ///
+    /// 这是「解配」唯一有用户可感交互的路径：A 点「删除设备」，B 的列表里该设备也要
+    /// 消失，而不是留一条每次同步都失败的死记录。
+    ///
+    /// 链路：A 本地删配对 → 后台线程连 B → PFS 握手 → `MSG_UNPAIR_NOTICE`
+    /// → B 校验 from 与已认证身份一致 → B 删配对 + 销毁两两密钥 → 回调宿主落库。
+    #[test]
+    fn unpair_notice_auto_unpairs_online_peer() {
+        use std::time::Duration;
+
+        let make_cfg = |id: &str, name: &str| SyncConfig {
+            device_id: id.into(),
+            device_name: name.into(),
+            device_type: "Windows".into(),
+            sync_port: 0,
+            discovery_port: 0,
+            pairing_pin: "000000".into(),
+        };
+
+        let node_a = MuClipSyncEngine::start(make_cfg("unpair-a", "Device A")).expect("start A");
+        let node_b = MuClipSyncEngine::start(make_cfg("unpair-b", "Device B")).expect("start B");
+        node_a.set_auto_discovery(false);
+        node_b.set_auto_discovery(false);
+
+        let port_a = node_a.bound_port();
+        let port_b = node_b.bound_port();
+
+        // B 侧先挂好「被解配」通知，用通道带超时收，避免回归时整个测试挂死
+        let (unpaired_tx, unpaired_rx) = std::sync::mpsc::channel::<String>();
+        node_b.on_peer_unpaired(Arc::new(move |dev_id| {
+            let _ = unpaired_tx.send(dev_id);
+        }));
+
+        // 配对：A 发请求，B 用 PIN 应答
+        {
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let b_ref = Arc::clone(&node_b);
+            node_b.on_pair_request_received(Arc::new(move |req_id, _from_id, _from_name, _ip| {
+                let b_inner = Arc::clone(&b_ref);
+                let tx = done_tx.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(20));
+                    assert_eq!(b_inner.respond_pair(&req_id, "246813", true), 0);
+                    let _ = tx.send(());
+                });
+            }));
+            let resp = node_a
+                .request_pair(&format!("127.0.0.1:{}", port_b), "246813", 5)
+                .expect("pair A->B");
+            assert!(resp.accepted, "配对应成功");
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("B respond_pair done");
+            node_a.add_paired_device(&format!("unpair-b|127.0.0.1|{}", port_b));
+            node_b.add_paired_device(&format!("unpair-a|127.0.0.1|{}", port_a));
+        }
+
+        let key_ab = node_a
+            .peer_manager
+            .get_peer_key("unpair-b")
+            .expect("A 侧应有对等密钥");
+        assert_eq!(node_b.peer_manager.get_peer_key("unpair-a"), Some(key_ab));
+        assert!(node_a.peer_manager.is_paired("unpair-b"));
+        assert!(node_b.peer_manager.is_paired("unpair-a"));
+
+        // A 解配 B（带端点提示，等价于 UI 上点「删除设备」）
+        node_a.remove_paired_device(&format!("unpair-b|127.0.0.1|{}", port_b));
+
+        assert!(
+            !node_a.peer_manager.is_paired("unpair-b"),
+            "发起方必须立刻完成本地解配，不能等通告结果"
+        );
+
+        let got = unpaired_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("对端在线时必须收到解配通告；收不到说明通告没送达（密钥/握手/路由任一环断了）");
+        assert_eq!(got, "unpair-a", "通告里的设备 id 必须是发起方");
+
+        assert!(
+            !node_b.peer_manager.is_paired("unpair-a"),
+            "接收方必须自动解配，否则列表里会留下一条同步必败的死记录"
+        );
+        assert!(
+            node_b.peer_manager.get_peer_key("unpair-a").is_none(),
+            "解配必须连带销毁对等密钥，否则对端仍能完成 PFS 握手"
+        );
+
+        node_a.stop();
+        node_b.stop();
+    }
+
+    /// 对端**离线时**被解配：等本端下次同步到它，收到 `ERR_NOT_PAIRED` 后本地自行清理。
+    ///
+    /// 这条补的是通告送不到的那一半：A 离线 → B 解配时发不出通告 → A 复网后仍以为
+    /// 自己是配对的。修前这里只被用来「别把 peer 误标成离线」，配对记录与密钥都留着，
+    /// UI 上表现为「每条剪贴板都同步失败」，用户还得再手动删一次。
+    #[test]
+    fn err_not_paired_clears_stale_pairing_locally() {
+        use std::time::Duration;
+
+        let make_cfg = |id: &str, name: &str| SyncConfig {
+            device_id: id.into(),
+            device_name: name.into(),
+            device_type: "Windows".into(),
+            sync_port: 0,
+            discovery_port: 0,
+            pairing_pin: "000000".into(),
+        };
+
+        let node_a = MuClipSyncEngine::start(make_cfg("stale-a", "Device A")).expect("start A");
+        let node_b = MuClipSyncEngine::start(make_cfg("stale-b", "Device B")).expect("start B");
+        node_a.set_auto_discovery(false);
+        node_b.set_auto_discovery(false);
+        let port_a = node_a.bound_port();
+        let port_b = node_b.bound_port();
+
+        // 配对（双方都建立两两密钥与白名单）
+        {
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let b_ref = Arc::clone(&node_b);
+            node_b.on_pair_request_received(Arc::new(move |req_id, _f, _n, _ip| {
+                let b_inner = Arc::clone(&b_ref);
+                let tx = done_tx.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(20));
+                    assert_eq!(b_inner.respond_pair(&req_id, "135790", true), 0);
+                    let _ = tx.send(());
+                });
+            }));
+            let resp = node_a
+                .request_pair(&format!("127.0.0.1:{}", port_b), "135790", 5)
+                .expect("pair A->B");
+            assert!(resp.accepted);
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("B respond_pair done");
+            node_a.add_paired_device(&format!("stale-b|127.0.0.1|{}", port_b));
+            node_b.add_paired_device(&format!("stale-a|127.0.0.1|{}", port_a));
+        }
+
+        let rx_b = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        {
+            let rx_ref = Arc::clone(&rx_b);
+            node_b.on_clipboard_received(Arc::new(move |p| {
+                rx_ref.lock().unwrap().push(p.content);
+            }));
+        }
+
+        // 先成功同步一次，让 A 侧建立长连接池（走的是「复用连接」那条分支，
+        // 只有那条分支才会收到明文 `ERR_NOT_PAIRED` 应答）
+        assert_eq!(node_a.broadcast_clipboard("warmup", "text/plain"), 1);
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(rx_b.lock().unwrap().as_slice(), &["warmup"]);
+
+        // B 单方面解配，但**不**发通告：模拟 B 在 A 离线时完成解配
+        node_b.peer_manager.remove_paired_device_id("stale-a");
+
+        // A 侧挂上「被解配」通知
+        let (unpaired_tx, unpaired_rx) = std::sync::mpsc::channel::<String>();
+        node_a.on_peer_unpaired(Arc::new(move |dev| {
+            let _ = unpaired_tx.send(dev);
+        }));
+
+        // A 再同步：连接池复用 → B 回 ERR_NOT_PAIRED → A 必须自行清除
+        assert_eq!(node_a.broadcast_clipboard("after-stale", "text/plain"), 0);
+
+        let got = unpaired_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("收到 ERR_NOT_PAIRED 后必须回调宿主，让 UI 与持久化记录一起清掉");
+        assert_eq!(got, "stale-b");
+        assert!(
+            !node_a.peer_manager.is_paired("stale-b"),
+            "收到 ERR_NOT_PAIRED 后本地必须解除配对"
+        );
+        assert!(
+            node_a.peer_manager.get_peer_key("stale-b").is_none(),
+            "失效配对的对等密钥必须一起销毁"
+        );
+        // B 侧没收到第二条内容
+        assert_eq!(rx_b.lock().unwrap().as_slice(), &["warmup"]);
+
+        node_a.stop();
+        node_b.stop();
     }
 }
