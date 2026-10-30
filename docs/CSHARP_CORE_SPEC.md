@@ -472,6 +472,17 @@ int32_t muclip_sync_cancel_file_transfer(MuClipSyncHandle* handle, const char* t
 ```
 - **功能**：随时取消正在进行的发送或接收传输任务。成功返回 `0`，失败返回 `-1`。
 
+#### `muclip_sync_set_auth_rejected_callback`
+```c
+void muclip_sync_set_auth_rejected_callback(
+    MuClipSyncHandle* handle,
+    void (*cb)(const char* device_id, uint32_t streak, void* user_data),
+    void* user_data);
+```
+- **功能**：同一对端**连续**被 PFS 会话握手拒绝满 3 次时回调一次（中途任意一次同步成功即清零重计）。
+- **含义**：`SyncRejected` 是笼统的认证失败，服务端刻意不区分原因——可能是对端已解配、两两密钥不一致（改过 PIN / 重装 / 用别的 PIN 重配），或端点串到了另一台设备。对未认证方暴露「你没配对」等于泄露配对状态，所以不做细分。
+- **宿主应当**：提示用户「与该设备的配对可能已失效，建议重新配对或删除设备」，**不要**自行删配对数据。core 也绝不会因这个信号解配——解配必须是用户的决定。
+
 ---
 
 ## 4. C# (.NET / Windows) 接入核心规范与避坑指南

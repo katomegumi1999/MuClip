@@ -600,6 +600,24 @@ pub unsafe extern "system" fn Java_com_muclip_core_MuClipNative_nativeRegisterSy
             }
         }));
 
+    // 4b. 同一对端连续被会话握手拒绝（只提示，不敢解配）。
+    // Kotlin 侧需实现 `onPeerAuthRejected(deviceId: String, streak: Int)` 才会收到；
+    // 方法不存在时 call_method 返回 Err，这里忽略即可 —— 旧版 App 继续按原样工作。
+    let h4b = Arc::clone(&holder);
+    wrapper
+        .engine
+        .on_peer_auth_rejected(Arc::new(move |device_id, streak| {
+            if let Ok(mut env) = h4b.vm.attach_current_thread() {
+                let j_id = env.new_string(device_id).unwrap_or_default();
+                let _ = env.call_method(
+                    &h4b.callback,
+                    "onPeerAuthRejected",
+                    "(Ljava/lang/String;I)V",
+                    &[(&j_id).into(), (streak as i32).into()],
+                );
+            }
+        }));
+
     // 5. Incoming file transfer offer callback
     let h5 = Arc::clone(&holder);
     wrapper.engine.on_file_offer(Arc::new(

@@ -567,6 +567,50 @@ struct SyncUnpairCallbackWrapper {
 unsafe impl Send for SyncUnpairCallbackWrapper {}
 unsafe impl Sync for SyncUnpairCallbackWrapper {}
 
+pub type MuClipAuthRejectedCallback =
+    unsafe extern "C" fn(device_id: *const c_char, streak: u32, user_data: *mut std::ffi::c_void);
+
+struct SyncAuthRejectedCallbackWrapper {
+    cb: MuClipAuthRejectedCallback,
+    user_data: usize,
+}
+unsafe impl Send for SyncAuthRejectedCallbackWrapper {}
+unsafe impl Sync for SyncAuthRejectedCallbackWrapper {}
+
+/// 注册「同一对端连续被会话握手拒绝」的提示回调。
+///
+/// 触发条件：连续 `AUTH_REJECT_HINT_THRESHOLD`（3）次认证被拒，中途任意一次同步成功
+/// 即清零。**只提示，不解配** —— `SyncRejected` 是笼统的认证失败，可能是对端已解配、
+/// 密钥不一致或地址串台，服务端刻意不区分原因（对未认证方暴露「你没配对」等于泄露
+/// 配对状态）。宿主收到后应提示用户「建议重新配对或删除该设备」，而不是自行删数据。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn muclip_sync_set_auth_rejected_callback(
+    handle: *mut MuClipSyncHandle,
+    callback: Option<MuClipAuthRejectedCallback>,
+    user_data: *mut std::ffi::c_void,
+) {
+    if handle.is_null() {
+        return;
+    }
+    let engine = unsafe { &*handle };
+    if let Some(cb_fn) = callback {
+        let wrapper = Arc::new(SyncAuthRejectedCallbackWrapper {
+            cb: cb_fn,
+            user_data: user_data as usize,
+        });
+        engine
+            .inner
+            .on_peer_auth_rejected(Arc::new(move |dev_id, streak| {
+                let dev_id_c = CString::new(dev_id).unwrap_or_default();
+                let cb = wrapper.cb;
+                let ud = wrapper.user_data as *mut std::ffi::c_void;
+                unsafe {
+                    cb(dev_id_c.as_ptr(), streak, ud);
+                }
+            }));
+    }
+}
+
 /// Registers a callback invoked whenever a remote peer unpairs this device (`MSG_UNPAIR_NOTICE` or `ERR_NOT_PAIRED`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn muclip_sync_set_unpair_callback(

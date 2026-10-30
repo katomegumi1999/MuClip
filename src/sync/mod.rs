@@ -5,8 +5,9 @@ pub mod file_transfer;
 pub mod protocol;
 pub mod transport;
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use thiserror::Error;
 
 pub use crypto::{CryptoError, KEY_SIZE, compute_sha256_hex, derive_key};
@@ -37,6 +38,18 @@ pub enum SyncError {
 
 pub const DEFAULT_SYNC_PORT: u16 = 42424;
 
+/// 同一对端连续被会话握手拒绝多少次，才把「这配对可能已经废了」提示给宿主。
+///
+/// 为什么不是 1 次就提示：一次拒绝可能是启动竞态（对端还没把密钥写进内存）。
+/// 为什么提示而不是自动解配：`SyncRejected` 是**笼统**的认证失败，服务端刻意不区分
+/// 原因（对未认证方说「你没配对」等于泄露配对状态）。它可能是对端已解配，也可能是
+/// 密钥不一致（改过 PIN / 重装 / 用别的 PIN 重配）或地址串到了另一台设备 ——
+/// 后两种情况贸然自清会误伤一条本来还能恢复的配对。
+pub const AUTH_REJECT_HINT_THRESHOLD: u32 = 3;
+
+/// 会话握手连续被拒的通知：`(device_id, 连续次数)`。仅为提示，不做任何自动清理。
+pub type AuthRejectedCallback = Arc<dyn Fn(&str, u32) + Send + Sync + 'static>;
+
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
     pub device_id: String,
@@ -59,6 +72,9 @@ pub struct MuClipSyncEngine {
     file_transfer_mgr: Arc<FileTransferManager>,
     manual_peers: Arc<RwLock<Vec<String>>>,
     bound_port: u16,
+    /// 每个 peer 连续被会话握手拒绝的次数，成功一次即清零。
+    auth_reject_streaks: Arc<Mutex<HashMap<String, u32>>>,
+    auth_rejected_callback: Arc<RwLock<Option<AuthRejectedCallback>>>,
 }
 
 impl MuClipSyncEngine {
@@ -156,6 +172,8 @@ impl MuClipSyncEngine {
             file_transfer_mgr,
             manual_peers,
             bound_port,
+            auth_reject_streaks: Arc::new(Mutex::new(HashMap::new())),
+            auth_rejected_callback: Arc::new(RwLock::new(None)),
         }))
     }
 
@@ -210,6 +228,63 @@ impl MuClipSyncEngine {
     /// Sets callback when remote peer sends an unpair notice.
     pub fn on_peer_unpaired(&self, cb: UnpairCallback) {
         self.server.set_unpair_callback(cb);
+    }
+
+    /// 注册「同一对端连续被会话握手拒绝」的提示回调。
+    ///
+    /// 只在连续次数**首次**达到 [`AUTH_REJECT_HINT_THRESHOLD`] 时回调一次；期间任意一次
+    /// 同步成功即清零重计。回调只做提示，core 不会因此删配对或销毁密钥 ——
+    /// 用户看到提示后自己决定是「重新配对」还是「删除设备」。
+    pub fn on_peer_auth_rejected(&self, cb: AuthRejectedCallback) {
+        if let Ok(mut slot) = self.auth_rejected_callback.write() {
+            *slot = Some(cb);
+        }
+    }
+
+    /// 记一次会话握手被拒，返回该 peer 的连续次数。
+    ///
+    /// 日志频率是刻意压过的：第 1 次和每 10 次记一条 WARN。剪贴板每次复制都会触发一轮
+    /// 同步，若每次拒绝都打日志，一个坏掉的配对几秒钟就能把环形缓冲刷满，真问题反而被埋掉。
+    fn note_auth_rejected(&self, device_id: &str, addr: &str) -> u32 {
+        let streak = {
+            let mut map = self
+                .auth_reject_streaks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let counter = map.entry(device_id.to_string()).or_insert(0);
+            *counter += 1;
+            *counter
+        };
+
+        if streak == 1 || streak % 10 == 0 {
+            crate::log_warn!(
+                "会话认证被 {} ({}) 拒绝，连续第 {} 次：可能是对端已解配、两两密钥不一致（改过 PIN / 重装 / 用别的 PIN 重配），或地址串到了另一台设备",
+                device_id,
+                addr,
+                streak
+            );
+        }
+
+        if streak == AUTH_REJECT_HINT_THRESHOLD {
+            // 先放读锁再回调：回调里宿主很可能再调本引擎的接口（如重新配对），
+            // 持锁回调会自死锁（同 notify_progress 的历史教训）。
+            let cb = self
+                .auth_rejected_callback
+                .read()
+                .ok()
+                .and_then(|guard| guard.as_ref().map(Arc::clone));
+            if let Some(cb) = cb {
+                cb(device_id, streak);
+            }
+        }
+        streak
+    }
+
+    /// 同步成功一次就把连续拒绝计数清零：说明这条配对其实还能正常工作。
+    fn clear_auth_reject(&self, device_id: &str) {
+        if let Ok(mut map) = self.auth_reject_streaks.lock() {
+            map.remove(device_id);
+        }
     }
 
     /// Responds to an incoming pairing request: 0 = success, 1 = not found/expired, 2 = wrong pin.
@@ -506,6 +581,9 @@ impl MuClipSyncEngine {
                                 if let Some(ref dev_id) = dev_id_opt {
                                     peer_mgr_ref.set_peer_key(dev_id, cand_key);
                                     discovery_ref.touch_peer(dev_id);
+                                    // 这条配对还能用，把「连续被拒」的计数清零，
+                                    // 否则一次偶发竞态会让后续计数一路累加到误报阈值。
+                                    self.clear_auth_reject(dev_id);
                                 } else if let Some((h, p)) =
                                     discovery::parse_peer_endpoint(&addr, DEFAULT_SYNC_PORT)
                                 {
@@ -549,6 +627,19 @@ impl MuClipSyncEngine {
                                         peer_dev
                                     );
                                     self.server.notify_peer_unpaired(&peer_dev);
+                                }
+                            } else if matches!(e, TransportError::SyncRejected) {
+                                // 对端活着并且回了帧，只是不认这次认证 —— 不能当离线处理，
+                                // 也不做自动解配（原因可能是解配、密钥不一致或地址串台，
+                                // 服务端刻意不区分）。计数到阈值后只提示宿主一次。
+                                let peer_dev = dev_id_opt.clone().or_else(|| {
+                                    discovery::parse_peer_endpoint(&addr, DEFAULT_SYNC_PORT)
+                                        .and_then(|(h, p)| {
+                                            peer_mgr_ref.find_device_id_by_endpoint(&h, p)
+                                        })
+                                });
+                                if let Some(peer_dev) = peer_dev {
+                                    self.note_auth_rejected(&peer_dev, &addr);
                                 }
                             } else if let Some((h, p)) =
                                 discovery::parse_peer_endpoint(&addr, DEFAULT_SYNC_PORT)
@@ -1293,6 +1384,121 @@ mod tests {
         );
         // B 侧没收到第二条内容
         assert_eq!(rx_b.lock().unwrap().as_slice(), &["warmup"]);
+
+        node_a.stop();
+        node_b.stop();
+    }
+
+    /// 同一对端连续被会话握手拒绝到阈值时，提示宿主一次；中间成功一次则重新计数。
+    ///
+    /// `SyncRejected` 是笼统的认证失败（对端已解配 / 密钥不一致 / 地址串台），
+    /// 服务端刻意不区分原因，所以 core **不自动解配**，只把「这配对可能废了」告诉宿主。
+    /// 这条测试同时钉住「成功即清零」——否则偶发一次竞态就会让计数一路累加，
+    /// 几天后弹出一个毫无意义的提示。
+    #[test]
+    fn auth_rejected_hint_fires_at_threshold_and_resets_on_success() {
+        let make_cfg = |id: &str, name: &str| SyncConfig {
+            device_id: id.into(),
+            device_name: name.into(),
+            device_type: "Windows".into(),
+            sync_port: 0,
+            discovery_port: 0,
+            pairing_pin: "000000".into(),
+        };
+
+        let node_a = MuClipSyncEngine::start(make_cfg("hj-a", "Device A")).expect("start A");
+        let node_b = MuClipSyncEngine::start(make_cfg("hj-b", "Device B")).expect("start B");
+        node_a.set_auto_discovery(false);
+        node_b.set_auto_discovery(false);
+        let port_a = node_a.bound_port();
+        let port_b = node_b.bound_port();
+
+        {
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let b_ref = Arc::clone(&node_b);
+            node_b.on_pair_request_received(Arc::new(move |req_id, _f, _n, _ip| {
+                let b_inner = Arc::clone(&b_ref);
+                let tx = done_tx.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    assert_eq!(b_inner.respond_pair(&req_id, "975310", true), 0);
+                    let _ = tx.send(());
+                });
+            }));
+            let resp = node_a
+                .request_pair(&format!("127.0.0.1:{}", port_b), "975310", 5)
+                .expect("pair A->B");
+            assert!(resp.accepted);
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("B respond_pair done");
+            node_a.add_paired_device(&format!("hj-b|127.0.0.1|{}", port_b));
+            node_b.add_paired_device(&format!("hj-a|127.0.0.1|{}", port_a));
+        }
+
+        let key_ab = node_a
+            .peer_manager
+            .get_peer_key("hj-b")
+            .expect("A 侧对等密钥");
+
+        // 每次尝试前清掉连接池：PFS 会话一旦建立，换掉 peer_key 也不会让旧连接失效，
+        // 不清池就测不到「新建连接被拒」这个真实场景。
+        let sync_once = |text: &str| -> usize {
+            node_a.client.clear_connection_pool();
+            node_a.broadcast_clipboard(text, "text/plain")
+        };
+
+        let (hint_tx, hint_rx) = std::sync::mpsc::channel::<(String, u32)>();
+        node_a.on_peer_auth_rejected(Arc::new(move |dev, streak| {
+            let _ = hint_tx.send((dev.to_string(), streak));
+        }));
+
+        // 让 B 侧的对等密钥变成"另一把"：白名单仍保留 A，但 auth_tag 对不上，
+        // 于是每次 SESSION_INIT 都拿到 accepted=false（客户端视角就是 SyncRejected）。
+        // 这比"把 A 从白名单删掉"更贴近真实成因之一（改过 PIN / 对端重装后重新配对），
+        // 也避免踩到 ERR_NOT_PAIRED 那条分支（那是"对端确实解配了"，另有用例覆盖）。
+        let wrong_key = crate::sync::crypto::derive_key("some-other-pin", None).unwrap();
+        node_b.peer_manager.set_peer_key("hj-a", wrong_key);
+
+        // 连续被拒 2 次：未到阈值，不能打扰用户
+        assert_eq!(sync_once("hop 1"), 0);
+        assert_eq!(sync_once("hop 2"), 0);
+        assert!(
+            hint_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "未到阈值就提示，会在正常的启动竞态里误报"
+        );
+
+        // 恢复密钥：成功同步一次必须把连续计数清零
+        node_b.peer_manager.set_peer_key("hj-a", key_ab);
+        assert_eq!(sync_once("recovered"), 1);
+
+        // 再次把密钥弄错：又被打回原形，此时应从 1 重新数
+        node_b.peer_manager.set_peer_key("hj-a", wrong_key);
+        assert_eq!(sync_once("hop 3"), 0);
+        assert_eq!(sync_once("hop 4"), 0);
+        assert!(
+            hint_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "成功一次后计数必须归零；不归零会提前触发提示"
+        );
+
+        // 第 3 次连续拒绝 —— 此时才提示
+        assert_eq!(sync_once("hop 5"), 0);
+        let (dev, streak) = hint_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("连续 3 次被拒必须提示宿主");
+        assert_eq!(dev, "hj-b");
+        assert_eq!(streak, AUTH_REJECT_HINT_THRESHOLD);
+
+        // 提示归提示，配对与密钥一律不许动（解配必须是用户的决定）
+        assert!(
+            node_a.peer_manager.is_paired("hj-b"),
+            "提示路径绝不能顺手解配"
+        );
+        assert!(node_a.peer_manager.get_peer_key("hj-b").is_some());
 
         node_a.stop();
         node_b.stop();
